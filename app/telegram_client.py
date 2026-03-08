@@ -23,37 +23,38 @@ async def query_number(number):
         await rate_limit()
         await human_delay()
 
-        await client.send_message(GROUP_ID, f"/num {number}")
+        try:
 
-        for _ in range(20):
+            await client.send_message(GROUP_ID, f"/num {number}")
 
-            msgs = await client.get_messages(GROUP_ID, limit=5)
+            for _ in range(20):
 
-            for msg in msgs:
+                msgs = await client.get_messages(GROUP_ID, limit=5)
 
-                if msg.text and "{" in msg.text:
+                for msg in msgs:
 
-                    data = extract_json(msg.text)
+                    if msg.text and "{" in msg.text:
 
-                    if not data:
-                        continue
+                        data = extract_json(msg.text)
 
-                    # ensure JSON belongs to this request
-                    if data.get("input") != number:
-                        continue
+                        if not data:
+                            continue
 
-                    print("CORRECT JSON FOUND:\n", data)
+                        # ensure JSON belongs to this request
+                        if data.get("input") != number:
+                            continue
 
-                    return clean_data(data, REPLACE_USERNAME)
+                        print("CORRECT JSON FOUND:\n", data)
 
-            await asyncio.sleep(2)
+                        return clean_data(data, REPLACE_USERNAME)
 
-        return {"error": "JSON not detected"}
+                await asyncio.sleep(2)
+
+            return {"error": "JSON not detected"}
 
         except FloodWaitError as e:
 
             wait = e.seconds + 5
-
             print(f"FloodWait {wait}s")
 
             await asyncio.sleep(wait)
