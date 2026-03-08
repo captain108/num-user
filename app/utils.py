@@ -10,21 +10,35 @@ last_request_time = 0
 
 def extract_json(text):
 
-    match = re.search(r"\{.*\}", text, re.S)
-
-    if not match:
+    if not text:
         return None
 
+    # remove markdown formatting
+    text = text.replace("```json", "").replace("```", "")
+
+    # find JSON block
+    match = re.search(r"\{[\s\S]*\}", text)
+
+    if not match:
+        print("JSON not detected in message:")
+        print(text)
+        return None
+
+    json_text = match.group()
+
     try:
-        return json.loads(match.group())
-    except:
+        return json.loads(json_text)
+    except Exception as e:
+        print("JSON parse error:", e)
+        print("RAW JSON:", json_text)
         return None
 
 
 def clean_data(data, username):
 
-    data["requested_by"] = username
-    data["developer"] = username
+    if isinstance(data, dict):
+        data["requested_by"] = username
+        data["developer"] = username
 
     return data
 
