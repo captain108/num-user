@@ -22,20 +22,24 @@ async def query_number(number):
 
         await rate_limit()
 
-        async with client.conversation(GROUP_ID, timeout=60) as conv:
+        async with client.conversation(GROUP_ID, timeout=120) as conv:
 
             try:
 
                 await human_delay()
 
+                # send command
                 await conv.send_message(f"/num {number}")
 
+                # wait for bot reply
                 response = await conv.get_response()
+
+                print("BOT MESSAGE:\n", response.raw_text)
 
                 data = extract_json(response.raw_text)
 
                 if not data:
-                    return {"error": "JSON not found"}
+                    return {"error": "JSON not detected"}
 
                 return clean_data(data, REPLACE_USERNAME)
 
