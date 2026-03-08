@@ -21,34 +21,38 @@ async def query_number(number):
     async with request_lock:
 
         await rate_limit()
+        await human_delay()
 
-        async with client.conversation(GROUP_ID, timeout=120) as conv:
+        try:
+            # send command
+            await client.send_message(GROUP_ID, f"/num {number}")
 
-            try:
+            # wait for JSON message
+            for _ in range(20):   # try for ~40 seconds
 
-                await human_delay()
+                msgs = await client.get_messages(GROUP_ID, limit=5)
 
-                # send command
-                await conv.send_message(f"/num {number}")
+                for msg in msgs:
 
-                # wait for bot reply
-                response = await conv.get_response()
+                    if msg.text and "{" in msg.text:
 
-                print("BOT MESSAGE:\n", response.raw_text)
+                        print("JSON MESSAGE FOUND:\n", msg.text)
 
-                data = extract_json(response.raw_text)
+                        data = extract_json(msg.text)
 
-                if not data:
-                    return {"error": "JSON not detected"}
+                        if data:
+                            return clean_data(data, REPLACE_USERNAME)
 
-                return clean_data(data, REPLACE_USERNAME)
+                await asyncio.sleep(2)
 
-            except FloodWaitError as e:
+            return {"error": "JSON not detected"}
 
-                wait = e.seconds + 5
+        except FloodWaitError as e:
 
-                print(f"FloodWait {wait}s")
+            wait = e.seconds + 5
 
-                await asyncio.sleep(wait)
+            print(f"FloodWait {wait}s")
 
-                return await query_number(number)
+            await asyncio.sleep(wait)
+
+            return await query_number(number)
