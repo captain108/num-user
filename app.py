@@ -27,7 +27,7 @@ GROUP_ID = int(os.getenv("GROUP_ID"))
 
 MIN_DELAY = float(os.getenv("MIN_DELAY", 0.5))
 MAX_DELAY = float(os.getenv("MAX_DELAY", 1.5))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 6))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
 CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
 API_KEY = os.getenv("API_KEY", "pak_captain123")
 
@@ -63,7 +63,7 @@ def is_valid_response(text: str) -> bool:
 
 def extract_data(text: str) -> dict:
     result = {}
-    # Query number
+    # Query number (the number we asked for)
     query_match = re.search(r"Query:\s*(\+?\d+)", text, re.I)
     if query_match:
         result["query"] = query_match.group(1)
@@ -75,7 +75,7 @@ def extract_data(text: str) -> dict:
     code_match = re.search(r"Country Code[:\s]*(\+\d+)", text, re.I)
     if code_match:
         result["code"] = code_match.group(1)
-    # Phone number
+    # Phone number (linked number)
     number_match = re.search(r"Number[:\s]*(\+?\d+)", text, re.I)
     if number_match:
         result["number"] = number_match.group(1)
@@ -84,15 +84,6 @@ def extract_data(text: str) -> dict:
     if tgid_match:
         result["telegram_id"] = tgid_match.group(1)
     return result
-
-def merge_responses(responses: list) -> dict:
-    merged = {}
-    for resp in responses:
-        data = extract_data(resp)
-        for k, v in data.items():
-            if k not in merged and v:
-                merged[k] = v
-    return merged
 
 def get_cached(value: str):
     entry = cache.get(value)
@@ -112,7 +103,7 @@ async def group_handler(event):
     text = event.raw_text
     logger.info(f"📥 Bot: {text[:200]}")
 
-    # Extract the phone number from the bot's reply (e.g., "Query: 5529934787")
+    # Extract the phone number that was queried (e.g., "Query: 5529934787")
     query_match = re.search(r"Query:\s*(\+?\d+)", text, re.I)
     if not query_match:
         return
@@ -129,7 +120,7 @@ async def random_delay():
 # ================= QUERY BOT (sends /tg and /tgid) =================
 async def query_bot(value: str, timeout: int = REQUEST_TIMEOUT) -> list:
     """
-    Send /tg and /tgid without any extra tags.
+    Send /tg and /tgid (clean, no extra tags).
     Wait for bot responses that contain the same number.
     """
     future = asyncio.get_event_loop().create_future()
@@ -148,7 +139,7 @@ async def query_bot(value: str, timeout: int = REQUEST_TIMEOUT) -> list:
         await asyncio.sleep(1.0)   # short delay between commands
         await send_command("/tgid")
 
-        # We expect up to 2 responses (one for each command)
+        # Wait for up to 2 responses (but only valid ones count)
         for i in range(2):
             try:
                 resp = await asyncio.wait_for(future, timeout=timeout)
@@ -179,7 +170,10 @@ async def handle_lookup(value: str):
     responses = await query_bot(value)
     if not responses:
         return {"status": "error", "message": "No valid bot responses received"}
-    merged = merge_responses(responses)
+    # Merge responses (in case both commands give data, though likely only /tgid works)
+    merged = {}
+    for resp in responses:
+        merged.update(extract_data(resp))
     if not merged:
         return {
             "status": "error",
