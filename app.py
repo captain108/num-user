@@ -48,12 +48,12 @@ def is_rate_limited(ip: str) -> bool:
 
 # ================= TELEGRAM CLIENT =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-pending_requests = {}
+pending_requests = {}  # key = phone number, value = asyncio.Future
 cache = {}
 
 # ================= RESPONSE VALIDATION =================
 INVALID_KEYWORDS = ["unknown command", "command not found", "use /help", "invalid", "error", "failed"]
-VALID_HINTS = ["country", "code", "number", "telegram", "id", "phone"]
+VALID_HINTS = ["country", "code", "number", "telegram", "id", "phone", "query"]
 
 def is_valid_response(text: str) -> bool:
     text_lower = text.lower()
@@ -63,17 +63,26 @@ def is_valid_response(text: str) -> bool:
 
 def extract_data(text: str) -> dict:
     result = {}
-    number_match = re.search(r"(?:phone|id|number)[:\s]*(\+?\d{6,})", text, re.I)
-    if not number_match:
-        number_match = re.search(r"(\+?\d{7,15})", text)
-    if number_match:
-        result["number"] = number_match.group(1)
-    country_match = re.search(r"country[:\s]*([A-Za-z\s]+)", text, re.I)
+    # Query number
+    query_match = re.search(r"Query:\s*(\+?\d+)", text, re.I)
+    if query_match:
+        result["query"] = query_match.group(1)
+    # Country
+    country_match = re.search(r"Country[:\s]*([A-Za-z\s]+)", text, re.I)
     if country_match:
         result["country"] = country_match.group(1).strip()
-    code_match = re.search(r"(\+\d{1,4})", text)
+    # Country code
+    code_match = re.search(r"Country Code[:\s]*(\+\d+)", text, re.I)
     if code_match:
         result["code"] = code_match.group(1)
+    # Phone number
+    number_match = re.search(r"Number[:\s]*(\+?\d+)", text, re.I)
+    if number_match:
+        result["number"] = number_match.group(1)
+    # Telegram ID
+    tgid_match = re.search(r"Tg Id[:\s]*(\d+)", text, re.I)
+    if tgid_match:
+        result["telegram_id"] = tgid_match.group(1)
     return result
 
 def merge_responses(responses: list) -> dict:
@@ -94,50 +103,66 @@ def get_cached(value: str):
 def set_cache(value: str, result: dict):
     cache[value] = {"result": result, "time": time.time()}
 
+# ================= EVENT HANDLER =================
 @client.on(events.NewMessage(chats=GROUP_ID))
 async def group_handler(event):
     sender = await event.get_sender()
     if not sender or not sender.bot:
         return
     text = event.raw_text
-    corr_match = re.search(r"\[REQ:(\d+)\]", text)
-    if not corr_match:
+    logger.info(f"📥 Bot: {text[:200]}")
+
+    # Extract the phone number from the bot's reply (e.g., "Query: 5529934787")
+    query_match = re.search(r"Query:\s*(\+?\d+)", text, re.I)
+    if not query_match:
         return
-    corr_id = corr_match.group(1)
-    future = pending_requests.get(corr_id)
+    number = query_match.group(1)
+
+    future = pending_requests.get(number)
     if future and not future.done():
+        logger.info(f"✅ Matched response for {number}")
         future.set_result(text)
 
 async def random_delay():
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
+# ================= QUERY BOT (sends /tg and /tgid) =================
 async def query_bot(value: str, timeout: int = REQUEST_TIMEOUT) -> list:
-    corr_id = str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
+    """
+    Send /tg and /tgid without any extra tags.
+    Wait for bot responses that contain the same number.
+    """
     future = asyncio.get_event_loop().create_future()
-    pending_requests[corr_id] = future
+    pending_requests[value] = future
     responses = []
 
-    async def send_command(command: str):
+    async def send_command(cmd: str):
         await random_delay()
-        full_command = f"{command} {value} [REQ:{corr_id}]"
-        logger.info(f"📤 Sending {full_command}")
-        await client.send_message(GROUP_ID, full_command)
+        command = f"{cmd} {value}"
+        logger.info(f"📤 Sending {command}")
+        await client.send_message(GROUP_ID, command)
 
     try:
+        # Send both commands
         await send_command("/tg")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1.0)   # short delay between commands
         await send_command("/tgid")
-        while len(responses) < 2:
+
+        # We expect up to 2 responses (one for each command)
+        for i in range(2):
             try:
                 resp = await asyncio.wait_for(future, timeout=timeout)
                 if is_valid_response(resp):
                     responses.append(resp)
+                # Create a new future for the next response
                 future = asyncio.get_event_loop().create_future()
-                pending_requests[corr_id] = future
+                pending_requests[value] = future
             except asyncio.TimeoutError:
+                logger.warning(f"Timeout waiting for response {i+1}/2")
                 break
     finally:
-        pending_requests.pop(corr_id, None)
+        pending_requests.pop(value, None)
+
     return responses
 
 async def handle_lookup(value: str):
@@ -156,7 +181,11 @@ async def handle_lookup(value: str):
         return {"status": "error", "message": "No valid bot responses received"}
     merged = merge_responses(responses)
     if not merged:
-        return {"status": "error", "message": "Could not extract data", "raw_responses": responses}
+        return {
+            "status": "error",
+            "message": "Could not extract data",
+            "raw_responses": responses,
+        }
     set_cache(value, merged)
     return {
         "status": "success",
