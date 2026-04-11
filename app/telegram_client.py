@@ -33,24 +33,30 @@ async def query_number(number):
 
                 for msg in msgs:
 
-                    if msg.text and "{" in msg.text:
+                    if not msg.text:
+                        continue
 
-                        data = extract_json(msg.text)
+                    text = msg.text
+
+                    # ✅ UI + JSON BOTH SUPPORT
+                    if "Query:" in text and "Result Country" in text:
+
+                        data = extract_json(text)
 
                         if not data:
                             continue
 
-                        # ensure JSON belongs to this request
-                        if data.get("input") != number:
+                        # ✅ number match fix
+                        if str(data.get("input")) != str(number):
                             continue
 
-                        print("CORRECT JSON FOUND:\n", data)
+                        print("✅ DATA FOUND:\n", data)
 
                         return clean_data(data, REPLACE_USERNAME)
 
                 await asyncio.sleep(2)
 
-            return {"error": "JSON not detected"}
+            return {"error": "No valid response detected"}
 
         except FloodWaitError as e:
 
