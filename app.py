@@ -29,6 +29,8 @@ client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 CACHE = {}
 CACHE_TTL = 60
 
+CLIENT_READY = False
+
 def get_cache(value):
     data = CACHE.get(value)
     if not data:
@@ -178,12 +180,25 @@ def lookup():
             "message": "Missing id"
         })
 
+    if not CLIENT_READY:
+        return jsonify({
+            "status": "error",
+            "message": "System initializing, try again..."
+        })
+
     future = asyncio.run_coroutine_threadsafe(
         handle_query_api(value),
         MAIN_LOOP
     )
-    
-    result = future.result()
+
+    try:
+        result = future.result(timeout=8)
+    except Exception as e:
+        print("❌ API ERROR:", e)
+        return jsonify({
+            "status": "error",
+            "message": "Timeout or internal error"
+        })
 
     return jsonify(result)
 
@@ -208,7 +223,12 @@ threading.Thread(
 
 # start telethon properly
 async def init_client():
-    await client.start()
-    print("✅ Telethon Started")
+    global CLIENT_READY
+    try:
+        await client.start()
+        CLIENT_READY = True
+        print("✅ Telethon Started")
+    except Exception as e:
+        print("❌ Telethon Failed:", e)
 
 asyncio.run_coroutine_threadsafe(init_client(), loop)
