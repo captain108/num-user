@@ -1,5 +1,12 @@
 import re
 import json
+import asyncio
+import random
+import time
+from app.config import MIN_DELAY, MAX_DELAY
+
+last_request_time = 0
+
 
 def extract_json(text):
 
@@ -8,6 +15,7 @@ def extract_json(text):
 
     text = text.replace("```json", "").replace("```", "")
 
+    # ✅ try JSON
     match = re.search(r"\{[\s\S]*\}", text)
     if match:
         try:
@@ -15,6 +23,7 @@ def extract_json(text):
         except:
             pass
 
+    # ✅ fallback UI parse
     return parse_ui(text)
 
 
@@ -51,6 +60,27 @@ def parse_ui(text):
 def clean_data(data, username):
 
     if isinstance(data, dict):
-    
         data["developer"] = "@captainpapaji"
+
     return data
+
+
+# 🔥 ADD THIS (IMPORTANT)
+async def human_delay():
+    delay = random.uniform(MIN_DELAY, MAX_DELAY)
+    print(f"Sleeping {delay:.2f}s")
+    await asyncio.sleep(delay)
+
+
+# 🔥 ADD THIS (IMPORTANT)
+async def rate_limit():
+
+    global last_request_time
+
+    now = time.time()
+    diff = now - last_request_time
+
+    if diff < MIN_DELAY:
+        await asyncio.sleep(MIN_DELAY - diff)
+
+    last_request_time = time.time()
