@@ -3,7 +3,6 @@ import asyncio
 import time
 import re
 import random
-import threading
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -133,13 +132,12 @@ async def handle_query_api(value):
     cached = get_cache(value)
 
     if cached:
-        ms = int((time.time() - start) * 1000)
         return {
             "status": "success",
             "query": value,
             "data": cached,
             "cached": True,
-            "response_time": f"{ms}ms"
+            "response_time": f"{int((time.time()-start)*1000)}ms"
         }
 
     responses = await fetch_parallel(value)
@@ -151,17 +149,14 @@ async def handle_query_api(value):
         }
 
     merged = merge_all(responses)
-
     set_cache(value, merged)
-
-    ms = int((time.time() - start) * 1000)
 
     return {
         "status": "success",
         "query": value,
         "data": merged,
         "cached": False,
-        "response_time": f"{ms}ms"
+        "response_time": f"{int((time.time()-start)*1000)}ms"
     }
 
 # ================= FLASK =================
@@ -189,15 +184,8 @@ def lookup():
 
     return jsonify(result)
 
-# ================= START SYSTEM =================
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-async def start_client():
-    await client.start()
-    print("✅ Userbot Connected")
-
-# ================= MAIN =================
-if __name__ == "__main__":
-    threading.Thread(target=run_flask).start()
-    asyncio.run(start_client())
+# ================= TELETHON START (FIX) =================
+@app.before_first_request
+def start_telethon():
+    loop = asyncio.get_event_loop()
+    loop.create_task(client.start())
