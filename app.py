@@ -2,12 +2,23 @@ import os
 import asyncio
 import time
 import re
+import logging
 import random
-import threading
+import signal
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from flask import Flask, request, jsonify
+from quart import Quart, request, jsonify
+from quart_limiter import Limiter
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+# ================= LOGGING =================
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("tg-lookup")
 
 # ================= LOAD ENV =================
 load_dotenv()
@@ -15,216 +26,225 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
-
 GROUP_ID = int(os.getenv("GROUP_ID"))
 
 MIN_DELAY = float(os.getenv("MIN_DELAY", 0.5))
 MAX_DELAY = float(os.getenv("MAX_DELAY", 1.5))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 6))
+CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
 
-# ================= CLIENT =================
+# API key for authentication (set in .env or change as needed)
+API_KEY = os.getenv("API_KEY", "pak_captain123")  # default matches your example
+
+# ================= TELEGRAM CLIENT =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# ================= CACHE =================
-CACHE = {}
-CACHE_TTL = 60
+# ================= GLOBAL STATE =================
+pending_requests = {}  # {correlation_id: asyncio.Future}
+cache = {}  # {value: {"result": merged_data, "time": timestamp}}
 
-CLIENT_READY = False
+# ================= HELPER: DELAY =================
+async def random_delay():
+    await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-# ================= FILTER =================
+# ================= RESPONSE VALIDATION =================
 INVALID_KEYWORDS = [
     "unknown command",
     "command not found",
     "use /help",
     "invalid",
     "error",
-    "failed"
+    "failed",
 ]
+VALID_HINTS = ["country", "code", "number", "telegram", "id", "phone"]
 
-VALID_HINTS = ["country", "code", "number", "telegram"]
-
-def is_valid_response(text):
+def is_valid_response(text: str) -> bool:
     text_lower = text.lower()
+    if any(word in text_lower for word in INVALID_KEYWORDS):
+        return False
+    return any(hint in text_lower for hint in VALID_HINTS)
 
-    for word in INVALID_KEYWORDS:
-        if word in text_lower:
-            return False
+# ================= EXTRACTION =================
+def extract_data(text: str) -> dict:
+    result = {}
+    # Phone number / ID
+    number_match = re.search(r"(?:phone|id|number)[:\s]*(\+?\d{6,})", text, re.I)
+    if not number_match:
+        number_match = re.search(r"(\+?\d{7,15})", text)
+    if number_match:
+        result["number"] = number_match.group(1)
 
-    for hint in VALID_HINTS:
-        if hint in text_lower:
-            return True
+    # Country name
+    country_match = re.search(r"country[:\s]*([A-Za-z\s]+)", text, re.I)
+    if country_match:
+        result["country"] = country_match.group(1).strip()
 
-    return False
+    # Country code
+    code_match = re.search(r"(\+\d{1,4})", text)
+    if code_match:
+        result["code"] = code_match.group(1)
 
-# ================= CACHE =================
-def get_cache(value):
-    data = CACHE.get(value)
-    if not data:
-        return None
-
-    if time.time() - data["time"] > CACHE_TTL:
-        CACHE.pop(value, None)
-        return None
-
-    return data["result"]
-
-def set_cache(value, result):
-    CACHE[value] = {
-        "result": result,
-        "time": time.time()
-    }
-
-# ================= DELAY =================
-async def random_delay():
-    await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-
-# ================= LISTEN GROUP =================
-async def listen_all(value, timeout=6):
-
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    results = []
-
-    async def handler(event):
-        sender = await event.get_sender()
-
-        if sender and sender.bot:
-            text = event.raw_text
-
-            print(f"📥 {sender.username} → {text}")
-
-            if str(value) in text:
-
-                if not is_valid_response(text):
-                    print("❌ Ignored invalid response")
-                    return
-
-                results.append(text)
-
-                if len(results) >= 2:
-                    if not future.done():
-                        future.set_result(results)
-
-    client.add_event_handler(handler, events.NewMessage(chats=GROUP_ID))
-
-    try:
-        await random_delay()
-
-        print(f"📤 Sending /tg {value}")
-        await client.send_message(GROUP_ID, f"/tg {value}")
-
-        await asyncio.sleep(0.5)
-
-        print(f"📤 Sending /tgid {value}")
-        await client.send_message(GROUP_ID, f"/tgid {value}")
-
-        result = await asyncio.wait_for(future, timeout=timeout)
-
-    except:
-        result = results
-
-    client.remove_event_handler(handler)
     return result
 
-# ================= PARSER =================
-def extract_data(text):
-    return {
-        "number": re.search(r"(\d{6,})", text),
-        "country": re.search(r"Country[:\s]*([A-Za-z]+)", text),
-        "code": re.search(r"(\+\d+)", text)
-    }
-
-def clean_extract(data):
-    return {k: v.group(1) for k, v in data.items() if v}
-
-def merge_all(texts):
-    final = {}
-
-    for t in texts:
-        data = clean_extract(extract_data(t))
+def merge_responses(responses: list) -> dict:
+    merged = {}
+    for resp in responses:
+        data = extract_data(resp)
         for k, v in data.items():
-            if k not in final:
-                final[k] = v
+            if k not in merged and v:
+                merged[k] = v
+    return merged
 
-    return final
+# ================= CACHE =================
+def get_cached(value: str):
+    entry = cache.get(value)
+    if entry and (time.time() - entry["time"]) < CACHE_TTL:
+        return entry["result"]
+    return None
 
-# ================= API =================
-async def handle_query_api(value):
+def set_cache(value: str, result: dict):
+    cache[value] = {"result": result, "time": time.time()}
 
+# ================= GLOBAL EVENT HANDLER =================
+@client.on(events.NewMessage(chats=GROUP_ID))
+async def group_handler(event):
+    sender = await event.get_sender()
+    if not sender or not sender.bot:
+        return
+
+    text = event.raw_text
+    logger.debug(f"📥 {sender.username or sender.id}: {text}")
+
+    corr_match = re.search(r"\[REQ:(\d+)\]", text)
+    if not corr_match:
+        return
+
+    corr_id = corr_match.group(1)
+    future = pending_requests.get(corr_id)
+    if future and not future.done():
+        future.set_result(text)
+
+# ================= SEND COMMANDS AND COLLECT =================
+async def query_bot(value: str, timeout: int = REQUEST_TIMEOUT) -> list:
+    corr_id = str(int(time.time() * 1000)) + str(random.randint(1000, 9999))
+    future = asyncio.get_event_loop().create_future()
+    pending_requests[corr_id] = future
+
+    responses = []
+
+    async def send_and_wait(command: str):
+        await random_delay()
+        full_command = f"{command} {value} [REQ:{corr_id}]"
+        logger.info(f"📤 Sending {full_command}")
+        await client.send_message(GROUP_ID, full_command)
+
+    try:
+        await send_and_wait("/tg")
+        await asyncio.sleep(0.5)
+        await send_and_wait("/tgid")
+
+        while len(responses) < 2:
+            try:
+                resp = await asyncio.wait_for(future, timeout=timeout)
+                if is_valid_response(resp):
+                    responses.append(resp)
+                future = asyncio.get_event_loop().create_future()
+                pending_requests[corr_id] = future
+            except asyncio.TimeoutError:
+                break
+    finally:
+        pending_requests.pop(corr_id, None)
+
+    return responses
+
+# ================= MAIN LOOKUP LOGIC =================
+async def handle_lookup(value: str):
     start = time.time()
 
-    cached = get_cache(value)
+    cached = get_cached(value)
     if cached:
         return {
             "status": "success",
             "query": value,
             "data": cached,
             "cached": True,
-            "response_time": f"{int((time.time()-start)*1000)}ms"
+            "response_time_ms": int((time.time() - start) * 1000),
         }
 
-    responses = await listen_all(value)
-
+    responses = await query_bot(value)
     if not responses:
         return {
             "status": "error",
-            "message": "No data found"
+            "message": "No valid bot responses received",
         }
 
-    merged = merge_all(responses)
-    set_cache(value, merged)
+    merged = merge_responses(responses)
+    if not merged:
+        return {
+            "status": "error",
+            "message": "Could not extract data from responses",
+            "raw_responses": responses,
+        }
 
+    set_cache(value, merged)
     return {
         "status": "success",
         "query": value,
         "data": merged,
         "cached": False,
-        "response_time": f"{int((time.time()-start)*1000)}ms"
+        "response_time_ms": int((time.time() - start) * 1000),
     }
 
-# ================= FLASK =================
-app = Flask(__name__)
+# ================= QUART APP =================
+@asynccontextmanager
+async def lifespan(app):
+    await client.start()
+    logger.info("✅ Telethon client started")
+    yield
+    await client.disconnect()
+    logger.info("🛑 Telethon client disconnected")
+
+app = Quart(__name__)
+app.asgi_app = ProxyFix(app.asgi_app)
+app.lifespan = lifespan
+
+# Rate limiter (adjust as needed)
+limiter = Limiter(app, default_limits=["10 per minute", "2 per second"])
 
 @app.route("/")
-def home():
-    return jsonify({"status": "running"})
+async def home():
+    return jsonify({"status": "running", "client_connected": client.is_connected()})
 
-@app.route("/lookup")
-def lookup():
+@app.route("/api/captainapi")
+@limiter.limit("10 per minute")
+async def captain_api():
+    # 1. Authenticate API key
+    key = request.args.get("key")
+    if not key or key != API_KEY:
+        return jsonify({"status": "error", "message": "Invalid or missing API key"}), 401
 
-    value = request.args.get("id")
+    # 2. Get the number to lookup
+    num = request.args.get("num")
+    if not num or not num.strip():
+        return jsonify({"status": "error", "message": "Missing 'num' parameter"}), 400
 
-    if not value:
-        return jsonify({"status": "error", "message": "Missing id"})
+    # Basic sanitization
+    if not re.match(r"^[A-Za-z0-9+\-\s]+$", num):
+        return jsonify({"status": "error", "message": "Invalid characters in 'num'"}), 400
 
-    if not CLIENT_READY:
-        return jsonify({"status": "error", "message": "System initializing..."})
+    if not client.is_connected():
+        return jsonify({"status": "error", "message": "Telegram client not ready"}), 503
 
-    future = asyncio.run_coroutine_threadsafe(
-        handle_query_api(value),
-        MAIN_LOOP
-    )
-
-    try:
-        result = future.result(timeout=10)
-    except:
-        return jsonify({"status": "error", "message": "Timeout"})
-
+    result = await handle_lookup(num.strip())
     return jsonify(result)
 
-# ================= TELETHON START =================
-def start_loop(loop):
-    asyncio.set_event_loop(loop)
-    loop.run_forever()
+# ================= GRACEFUL SHUTDOWN =================
+def shutdown():
+    logger.info("Shutting down...")
 
-loop = asyncio.new_event_loop()
-MAIN_LOOP = loop
+signal.signal(signal.SIGTERM, lambda *_: asyncio.create_task(shutdown()))
 
-threading.Thread(target=start_loop, args=(loop,), daemon=True).start()
-
-async def init():
-    global CLIENT_READY
-    await client.start()
-    CLIENT_READY = True
-    print("✅ Telethon Started")
-
-asyncio.run_coroutine_threadsafe(init(), loop)
+# ================= RUN =================
+if __name__ == "__main__":
+    # For development; use hypercorn in production
+    app.run(host="0.0.0.0", port=5000)
