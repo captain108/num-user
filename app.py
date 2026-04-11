@@ -93,7 +93,6 @@ async def get_json_from_bot(number: str, command: str):
             timeout=REQUEST_TIMEOUT,
             condition=lambda e: (
                 e.raw_text and
-                number in e.raw_text and
                 e.date.timestamp() >= start_time
             )
         )
