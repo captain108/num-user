@@ -4,13 +4,13 @@ import time
 import re
 import logging
 import random
-import signal
 from contextlib import asynccontextmanager
+from collections import defaultdict
+from datetime import datetime
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from quart import Quart, request, jsonify
-from quart_limiter import Limiter
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 # ================= LOGGING =================
@@ -33,15 +33,35 @@ MAX_DELAY = float(os.getenv("MAX_DELAY", 1.5))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 6))
 CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
 
-# API key for authentication (set in .env or change as needed)
-API_KEY = os.getenv("API_KEY", "pak_captain123")  # default matches your example
+API_KEY = os.getenv("API_KEY", "pak_captain123")
+
+# ================= RATE LIMITING SETUP =================
+# Simple in-memory rate limiter: {ip: [list of request timestamps]}
+rate_limit_store = defaultdict(list)
+RATE_LIMIT = 10  # requests
+RATE_LIMIT_PERIOD = 60  # seconds
+
+def is_rate_limited(ip: str) -> bool:
+    """Check if the IP has exceeded the rate limit."""
+    now = time.time()
+    # Get timestamps for this IP
+    timestamps = rate_limit_store[ip]
+    # Remove timestamps older than the period
+    while timestamps and timestamps[0] < now - RATE_LIMIT_PERIOD:
+        timestamps.pop(0)
+    # Check if limit is reached
+    if len(timestamps) >= RATE_LIMIT:
+        return True
+    # Add current request timestamp
+    timestamps.append(now)
+    return False
 
 # ================= TELEGRAM CLIENT =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
 # ================= GLOBAL STATE =================
-pending_requests = {}  # {correlation_id: asyncio.Future}
-cache = {}  # {value: {"result": merged_data, "time": timestamp}}
+pending_requests = {}
+cache = {}
 
 # ================= HELPER: DELAY =================
 async def random_delay():
@@ -67,19 +87,16 @@ def is_valid_response(text: str) -> bool:
 # ================= EXTRACTION =================
 def extract_data(text: str) -> dict:
     result = {}
-    # Phone number / ID
     number_match = re.search(r"(?:phone|id|number)[:\s]*(\+?\d{6,})", text, re.I)
     if not number_match:
         number_match = re.search(r"(\+?\d{7,15})", text)
     if number_match:
         result["number"] = number_match.group(1)
 
-    # Country name
     country_match = re.search(r"country[:\s]*([A-Za-z\s]+)", text, re.I)
     if country_match:
         result["country"] = country_match.group(1).strip()
 
-    # Country code
     code_match = re.search(r"(\+\d{1,4})", text)
     if code_match:
         result["code"] = code_match.group(1)
@@ -208,22 +225,26 @@ app = Quart(__name__)
 app.asgi_app = ProxyFix(app.asgi_app)
 app.lifespan = lifespan
 
-# Rate limiter (adjust as needed)
-limiter = Limiter(app, default_limits=["10 per minute", "2 per second"])
-
 @app.route("/")
 async def home():
     return jsonify({"status": "running", "client_connected": client.is_connected()})
 
 @app.route("/api/captainapi")
-@limiter.limit("10 per minute")
 async def captain_api():
-    # 1. Authenticate API key
+    # 1. Rate limiting based on IP
+    client_ip = request.remote_addr
+    if is_rate_limited(client_ip):
+        return jsonify({
+            "status": "error",
+            "message": "Rate limit exceeded. Try again later."
+        }), 429
+
+    # 2. Authenticate API key
     key = request.args.get("key")
     if not key or key != API_KEY:
         return jsonify({"status": "error", "message": "Invalid or missing API key"}), 401
 
-    # 2. Get the number to lookup
+    # 3. Get the number to lookup
     num = request.args.get("num")
     if not num or not num.strip():
         return jsonify({"status": "error", "message": "Missing 'num' parameter"}), 400
@@ -238,13 +259,6 @@ async def captain_api():
     result = await handle_lookup(num.strip())
     return jsonify(result)
 
-# ================= GRACEFUL SHUTDOWN =================
-def shutdown():
-    logger.info("Shutting down...")
-
-signal.signal(signal.SIGTERM, lambda *_: asyncio.create_task(shutdown()))
-
 # ================= RUN =================
 if __name__ == "__main__":
-    # For development; use hypercorn in production
     app.run(host="0.0.0.0", port=5000)
