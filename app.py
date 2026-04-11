@@ -39,13 +39,12 @@ def is_rate_limited(ip: str) -> bool:
     return False
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-cache = {}  # {command+number: {"data": dict, "time": float}}
+cache = {}
 
 def clean_json(data: dict) -> dict:
     """Remove unwanted fields like cached, proxyUsed, attempt, credits, etc."""
     if not isinstance(data, dict):
         return data
-    # Fields to remove (exact or partial)
     remove_keys = ["cached", "proxyUsed", "attempt", "cached_at", "by", "Credits Left", "credits"]
     cleaned = {}
     for k, v in data.items():
@@ -60,32 +59,29 @@ def clean_json(data: dict) -> dict:
     return cleaned
 
 async def get_json_from_bot(number: str, command: str) -> dict:
-    """
-    Send command (either "/num" or "/tgid"), click Download JSON button,
-    download the JSON file, clean it, and return.
-    """
     cache_key = f"{command}:{number}"
     entry = cache.get(cache_key)
     if entry and time.time() - entry["time"] < CACHE_TTL:
         logger.info(f"Cache hit for {cache_key}")
         return entry["data"]
 
-    # 1. Send command
+    me = await client.get_me()
+    my_id = me.id
+
     cmd = f"{command} {number}"
     logger.info(f"📤 Sending {cmd}")
     await client.send_message(GROUP_ID, cmd)
 
-    # 2. Wait for the bot's info message (contains the number and buttons)
     try:
+        # Wait for the bot's info message (contains number and buttons)
         info_msg = await client.wait_for(
             events.NewMessage(chats=GROUP_ID),
             timeout=REQUEST_TIMEOUT,
-            condition=lambda e: number in e.raw_text and e.sender_id != (await client.get_me()).id
+            condition=lambda e: number in e.raw_text and e.sender_id != my_id
         )
         msg = info_msg.message
-        logger.info(f"📥 Received info message")
 
-        # 3. Find the "Download JSON" button
+        # Find "Download JSON" button
         if not msg.reply_markup or not msg.reply_markup.rows:
             logger.error("No buttons found")
             return None
@@ -103,19 +99,16 @@ async def get_json_from_bot(number: str, command: str) -> dict:
             logger.error("No 'Download JSON' button")
             return None
 
-        # 4. Click the button
         logger.info(f"🔘 Clicking button: {target_button.text}")
         await client.click(msg, target_button)
 
-        # 5. Wait for the bot to send the JSON file (document)
+        # Wait for the JSON file
         file_msg = await client.wait_for(
             events.NewMessage(chats=GROUP_ID),
             timeout=REQUEST_TIMEOUT,
             condition=lambda e: e.document and e.document.mime_type == "application/json"
         )
-        logger.info(f"📎 Received JSON file")
 
-        # 6. Download and parse the file
         file_content = await client.download_media(file_msg.message, bytes)
         raw_data = json.loads(file_content.decode('utf-8'))
         cleaned = clean_json(raw_data)
@@ -147,7 +140,6 @@ async def home():
 
 @app.route("/num")
 async def num_endpoint():
-    """Send /num command to bot and return cleaned JSON."""
     ip = request.remote_addr
     if is_rate_limited(ip):
         return jsonify({"error": "Rate limit exceeded"}), 429
@@ -178,7 +170,6 @@ async def num_endpoint():
 
 @app.route("/tg")
 async def tg_endpoint():
-    """Send /tgid command to bot and return cleaned JSON."""
     ip = request.remote_addr
     if is_rate_limited(ip):
         return jsonify({"error": "Rate limit exceeded"}), 429
