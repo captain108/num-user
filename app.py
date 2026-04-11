@@ -79,7 +79,7 @@ async def get_json_from_bot(number: str, command: str):
             return cache[cache_key]["data"]
 
     req_id = str(uuid.uuid4())[:6]
-    cmd = f"{command} {number} {req_id}"
+    cmd = f"{command} {number}"
 
     logger.info(f"📤 Sending: {cmd}")
     await client.send_message(GROUP_ID, cmd)
@@ -92,7 +92,7 @@ async def get_json_from_bot(number: str, command: str):
             condition=lambda e: (
                 e.raw_text and
                 number in e.raw_text and
-                req_id in e.raw_text
+                e.date.timestamp() >= start_time
             )
         )
 
@@ -124,7 +124,8 @@ async def get_json_from_bot(number: str, command: str):
             timeout=REQUEST_TIMEOUT,
             condition=lambda e: (
                 e.document and
-                e.document.mime_type == "application/json"
+                e.document.mime_type == "application/json" and
+                e.date.timestamp() >= start_time
             )
         )
 
