@@ -1,5 +1,4 @@
-fastapi
-uvicorn
 telethon
 python-dotenv
 flask
+gunicorn
