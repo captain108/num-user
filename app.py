@@ -78,10 +78,12 @@ async def get_json_from_bot(number: str, command: str):
             logger.info(f"⚡ Cache hit {cache_key}")
             return cache[cache_key]["data"]
 
-    req_id = str(uuid.uuid4())[:6]
     cmd = f"{command} {number}"
 
     logger.info(f"📤 Sending: {cmd}")
+
+    start_time = time.time()
+    
     await client.send_message(GROUP_ID, cmd)
 
     try:
