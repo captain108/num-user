@@ -94,9 +94,9 @@ async def get_json_from_bot(number: str, command: str):
         
             if event.date.timestamp() < start_time:
                 return
-        
-                if not future.done():
-                    future.set_result(event)
+    
+            if not future.done():
+                future.set_result(event)
         
         client.add_event_handler(handler, events.NewMessage)
         
