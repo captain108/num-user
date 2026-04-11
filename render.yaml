@@ -1,9 +1,9 @@
 services:
   - type: web
-    name: telegram-userbot
+    name: captain-api
     runtime: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "bash start.sh"
+    buildCommand: pip install -r requirements.txt
+    startCommand: hypercorn app:app --bind 0.0.0.0:$PORT
     envVars:
       - key: API_ID
         sync: false
@@ -11,7 +11,7 @@ services:
         sync: false
       - key: STRING_SESSION
         sync: false
-      - key: BOT1
+      - key: GROUP_ID
         sync: false
-      - key: BOT2
+      - key: API_KEY
         sync: false
