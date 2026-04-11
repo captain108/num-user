@@ -16,11 +16,10 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
 
-BOT1 = os.getenv("BOT1")
-BOT2 = os.getenv("BOT2")
+GROUP_ID = int(os.getenv("GROUP_ID"))
 
-MIN_DELAY = int(os.getenv("MIN_DELAY", 1))
-MAX_DELAY = int(os.getenv("MAX_DELAY", 3))
+MIN_DELAY = float(os.getenv("MIN_DELAY", 0.5))
+MAX_DELAY = float(os.getenv("MAX_DELAY", 1.5))
 
 # ================= CLIENT =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -31,6 +30,32 @@ CACHE_TTL = 60
 
 CLIENT_READY = False
 
+# ================= FILTER =================
+INVALID_KEYWORDS = [
+    "unknown command",
+    "command not found",
+    "use /help",
+    "invalid",
+    "error",
+    "failed"
+]
+
+VALID_HINTS = ["country", "code", "number", "telegram"]
+
+def is_valid_response(text):
+    text_lower = text.lower()
+
+    for word in INVALID_KEYWORDS:
+        if word in text_lower:
+            return False
+
+    for hint in VALID_HINTS:
+        if hint in text_lower:
+            return True
+
+    return False
+
+# ================= CACHE =================
 def get_cache(value):
     data = CACHE.get(value)
     if not data:
@@ -52,56 +77,53 @@ def set_cache(value, result):
 async def random_delay():
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-# ================= LISTENER =================
-async def listen_bot(bot, command, value, timeout=4):
+# ================= LISTEN GROUP =================
+async def listen_all(value, timeout=6):
 
     loop = asyncio.get_event_loop()
     future = loop.create_future()
+    results = []
 
     async def handler(event):
-        text = event.raw_text
+        sender = await event.get_sender()
 
-        if str(value) in text:
-            if not future.done():
-                future.set_result(text)
+        if sender and sender.bot:
+            text = event.raw_text
 
-    client.add_event_handler(handler, events.NewMessage(from_users=bot))
+            print(f"📥 {sender.username} → {text}")
+
+            if str(value) in text:
+
+                if not is_valid_response(text):
+                    print("❌ Ignored invalid response")
+                    return
+
+                results.append(text)
+
+                if len(results) >= 2:
+                    if not future.done():
+                        future.set_result(results)
+
+    client.add_event_handler(handler, events.NewMessage(chats=GROUP_ID))
 
     try:
         await random_delay()
-        await client.send_message(bot, f"{command} {value}")
+
+        print(f"📤 Sending /tg {value}")
+        await client.send_message(GROUP_ID, f"/tg {value}")
+
+        await asyncio.sleep(0.5)
+
+        print(f"📤 Sending /tgid {value}")
+        await client.send_message(GROUP_ID, f"/tgid {value}")
+
         result = await asyncio.wait_for(future, timeout=timeout)
+
     except:
-        result = None
+        result = results
 
     client.remove_event_handler(handler)
     return result
-
-# ================= PARALLEL =================
-async def fetch_parallel(value):
-
-    task1 = asyncio.create_task(listen_bot(BOT1, "/tgid", value))
-    task2 = asyncio.create_task(listen_bot(BOT2, "/tg", value))
-
-    done, pending = await asyncio.wait(
-        [task1, task2],
-        return_when=asyncio.FIRST_COMPLETED
-    )
-
-    results = []
-
-    for d in done:
-        if d.result():
-            results.append(d.result())
-
-    for p in pending:
-        try:
-            if p.result():
-                results.append(p.result())
-        except:
-            pass
-
-    return results
 
 # ================= PARSER =================
 def extract_data(text):
@@ -115,25 +137,22 @@ def clean_extract(data):
     return {k: v.group(1) for k, v in data.items() if v}
 
 def merge_all(texts):
-
     final = {}
 
     for t in texts:
         data = clean_extract(extract_data(t))
-
         for k, v in data.items():
             if k not in final:
                 final[k] = v
 
     return final
 
-# ================= API LOGIC =================
+# ================= API =================
 async def handle_query_api(value):
 
     start = time.time()
 
     cached = get_cache(value)
-
     if cached:
         return {
             "status": "success",
@@ -143,7 +162,7 @@ async def handle_query_api(value):
             "response_time": f"{int((time.time()-start)*1000)}ms"
         }
 
-    responses = await fetch_parallel(value)
+    responses = await listen_all(value)
 
     if not responses:
         return {
@@ -169,22 +188,16 @@ app = Flask(__name__)
 def home():
     return jsonify({"status": "running"})
 
-@app.route("/lookup", methods=["GET"])
+@app.route("/lookup")
 def lookup():
 
     value = request.args.get("id")
 
     if not value:
-        return jsonify({
-            "status": "error",
-            "message": "Missing id"
-        })
+        return jsonify({"status": "error", "message": "Missing id"})
 
     if not CLIENT_READY:
-        return jsonify({
-            "status": "error",
-            "message": "System initializing, try again..."
-        })
+        return jsonify({"status": "error", "message": "System initializing..."})
 
     future = asyncio.run_coroutine_threadsafe(
         handle_query_api(value),
@@ -192,43 +205,26 @@ def lookup():
     )
 
     try:
-        result = future.result(timeout=8)
-    except Exception as e:
-        print("❌ API ERROR:", e)
-        return jsonify({
-            "status": "error",
-            "message": "Timeout or internal error"
-        })
+        result = future.result(timeout=10)
+    except:
+        return jsonify({"status": "error", "message": "Timeout"})
 
     return jsonify(result)
 
 # ================= TELETHON START =================
-
-def start_background_loop(loop):
+def start_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
-# create loop
 loop = asyncio.new_event_loop()
-
-# assign global loop
 MAIN_LOOP = loop
 
-# start loop thread
-threading.Thread(
-    target=start_background_loop,
-    args=(loop,),
-    daemon=True
-).start()
+threading.Thread(target=start_loop, args=(loop,), daemon=True).start()
 
-# start telethon properly
-async def init_client():
+async def init():
     global CLIENT_READY
-    try:
-        await client.start()
-        CLIENT_READY = True
-        print("✅ Telethon Started")
-    except Exception as e:
-        print("❌ Telethon Failed:", e)
+    await client.start()
+    CLIENT_READY = True
+    print("✅ Telethon Started")
 
-asyncio.run_coroutine_threadsafe(init_client(), loop)
+asyncio.run_coroutine_threadsafe(init(), loop)
