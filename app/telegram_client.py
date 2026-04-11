@@ -24,12 +24,17 @@ async def query_number(number):
         await human_delay()
 
         try:
+            # ✅ use correct command
+            await client.send_message(GROUP_ID, f"/tgid {number}")
 
-            await client.send_message(GROUP_ID, f"/num {number}")
+            # ✅ get last message id (important)
+            last_msg = await client.get_messages(GROUP_ID, limit=1)
+            last_id = last_msg[0].id if last_msg else 0
 
             for _ in range(20):
 
-                msgs = await client.get_messages(GROUP_ID, limit=5)
+                # ✅ only NEW messages
+                msgs = await client.get_messages(GROUP_ID, min_id=last_id, limit=5)
 
                 for msg in msgs:
 
@@ -38,7 +43,11 @@ async def query_number(number):
 
                     text = msg.text
 
-                    # ✅ UI + JSON BOTH SUPPORT
+                    # ✅ OPTIONAL: filter specific bot (RECOMMENDED)
+                    # if msg.sender_id != BOT_ID:
+                    #     continue
+
+                    # ✅ detect valid response
                     if "Query:" in text and "Result Country" in text:
 
                         data = extract_json(text)
@@ -46,7 +55,6 @@ async def query_number(number):
                         if not data:
                             continue
 
-                        # ✅ number match fix
                         if str(data.get("input")) != str(number):
                             continue
 
