@@ -27,9 +27,13 @@ GROUP_ID = int(os.getenv("GROUP_ID"))
 
 MIN_DELAY = float(os.getenv("MIN_DELAY", 0.5))
 MAX_DELAY = float(os.getenv("MAX_DELAY", 1.5))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 12))
 CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
 API_KEY = os.getenv("API_KEY", "pak_captain123")
+
+# Command toggles (set to "false" to disable)
+SEND_TG = os.getenv("SEND_TG", "true").lower() == "true"
+SEND_TGID = os.getenv("SEND_TGID", "true").lower() == "true"
 
 # ================= RATE LIMITING =================
 rate_limit_store = defaultdict(list)
@@ -63,23 +67,18 @@ def is_valid_response(text: str) -> bool:
 
 def extract_data(text: str) -> dict:
     result = {}
-    # Query number (the number we asked for)
     query_match = re.search(r"Query:\s*(\+?\d+)", text, re.I)
     if query_match:
         result["query"] = query_match.group(1)
-    # Country
     country_match = re.search(r"Country[:\s]*([A-Za-z\s]+)", text, re.I)
     if country_match:
         result["country"] = country_match.group(1).strip()
-    # Country code
     code_match = re.search(r"Country Code[:\s]*(\+\d+)", text, re.I)
     if code_match:
         result["code"] = code_match.group(1)
-    # Phone number (linked number)
     number_match = re.search(r"Number[:\s]*(\+?\d+)", text, re.I)
     if number_match:
         result["number"] = number_match.group(1)
-    # Telegram ID
     tgid_match = re.search(r"Tg Id[:\s]*(\d+)", text, re.I)
     if tgid_match:
         result["telegram_id"] = tgid_match.group(1)
@@ -103,7 +102,6 @@ async def group_handler(event):
     text = event.raw_text
     logger.info(f"📥 Bot: {text[:200]}")
 
-    # Extract the phone number that was queried (e.g., "Query: 5529934787")
     query_match = re.search(r"Query:\s*(\+?\d+)", text, re.I)
     if not query_match:
         return
@@ -117,15 +115,21 @@ async def group_handler(event):
 async def random_delay():
     await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
-# ================= QUERY BOT (sends /tg and /tgid) =================
+# ================= QUERY BOT (toggleable commands) =================
 async def query_bot(value: str, timeout: int = REQUEST_TIMEOUT) -> list:
-    """
-    Send /tg and /tgid (clean, no extra tags).
-    Wait for bot responses that contain the same number.
-    """
     future = asyncio.get_event_loop().create_future()
     pending_requests[value] = future
     responses = []
+
+    commands = []
+    if SEND_TG:
+        commands.append("/tg")
+    if SEND_TGID:
+        commands.append("/tgid")
+    
+    if not commands:
+        logger.error("Both SEND_TG and SEND_TGID are disabled. No commands to send.")
+        return responses
 
     async def send_command(cmd: str):
         await random_delay()
@@ -134,22 +138,23 @@ async def query_bot(value: str, timeout: int = REQUEST_TIMEOUT) -> list:
         await client.send_message(GROUP_ID, command)
 
     try:
-        # Send both commands
-        await send_command("/tg")
-        await asyncio.sleep(1.0)   # short delay between commands
-        await send_command("/tgid")
+        # Send each command with a 1 second delay between them
+        for idx, cmd in enumerate(commands):
+            await send_command(cmd)
+            if idx < len(commands) - 1:
+                await asyncio.sleep(1.0)
 
-        # Wait for up to 2 responses (but only valid ones count)
-        for i in range(2):
+        # Wait for responses (up to number of commands sent)
+        for i in range(len(commands)):
             try:
                 resp = await asyncio.wait_for(future, timeout=timeout)
                 if is_valid_response(resp):
                     responses.append(resp)
-                # Create a new future for the next response
+                # Create a new future for next response
                 future = asyncio.get_event_loop().create_future()
                 pending_requests[value] = future
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout waiting for response {i+1}/2")
+                logger.warning(f"Timeout waiting for response {i+1}/{len(commands)}")
                 break
     finally:
         pending_requests.pop(value, None)
@@ -170,7 +175,6 @@ async def handle_lookup(value: str):
     responses = await query_bot(value)
     if not responses:
         return {"status": "error", "message": "No valid bot responses received"}
-    # Merge responses (in case both commands give data, though likely only /tgid works)
     merged = {}
     for resp in responses:
         merged.update(extract_data(resp))
@@ -196,6 +200,7 @@ app = Quart(__name__)
 async def startup():
     await client.start()
     logger.info("✅ Telethon client started")
+    logger.info(f"Command toggles: SEND_TG={SEND_TG}, SEND_TGID={SEND_TGID}")
 
 @app.after_serving
 async def shutdown():
@@ -204,7 +209,14 @@ async def shutdown():
 
 @app.route("/")
 async def home():
-    return jsonify({"status": "running", "client_connected": client.is_connected()})
+    return jsonify({
+        "status": "running",
+        "client_connected": client.is_connected(),
+        "config": {
+            "send_tg": SEND_TG,
+            "send_tgid": SEND_TGID
+        }
+    })
 
 @app.route("/api/captainapi")
 async def captain_api():
