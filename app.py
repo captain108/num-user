@@ -92,7 +92,7 @@ async def get_json_from_bot(number: str, command: str):
             if event.chat_id != GROUP_ID:
                 return
 
-            if event.date.timestamp() < start_time:
+            if event.date.timestamp() < start_time - 2:
                 return
 
             sender = await event.get_sender()
@@ -139,18 +139,18 @@ async def get_json_from_bot(number: str, command: str):
         async def handler_json(event):
             if event.chat_id != GROUP_ID:
                 return
-
-            if event.date.timestamp() < start_time:
+        
+            # 🔥 small buffer (important)
+            if event.date.timestamp() < start_time - 2:
                 return
-
-            if (
-                event.document and
-                event.document.mime_type == "application/json" and
-                event.date.timestamp() >= start_time
-            ):
+        
+            sender = await event.get_sender()
+            if not sender or not sender.bot:
+                return
+        
+            if event.document and event.document.mime_type == "application/json":
                 if not future.done():
                     future.set_result(event)
-
         # ✅ ADD handler BEFORE click
         client.add_event_handler(handler_json, events.NewMessage)
 
