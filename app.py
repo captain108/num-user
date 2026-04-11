@@ -20,7 +20,7 @@ STRING_SESSION = os.getenv("STRING_SESSION")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 API_KEY = os.getenv("API_KEY", "pak_captain123")
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 10))   # 10 seconds max
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 20))   # 20 seconds for safety
 CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
 
 # Rate limiting
@@ -39,8 +39,12 @@ def is_rate_limited(ip: str) -> bool:
     return False
 
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-pending = {}   # {number: asyncio.Future}
-cache = {}     # {number: {"data": dict, "time": float}}
+pending = {}   # {normalized_number: asyncio.Future}
+cache = {}
+
+def normalize_number(num: str) -> str:
+    """Remove leading + and spaces, keep only digits."""
+    return re.sub(r'\D', '', num)
 
 def extract(text: str) -> dict:
     data = {}
@@ -59,47 +63,55 @@ def extract(text: str) -> dict:
 @client.on(events.NewMessage(chats=GROUP_ID))
 async def handler(event):
     text = event.raw_text
-    logger.info(f"📥 {text[:200]}")
-    # Match any pending number that appears in the message
-    for num, fut in list(pending.items()):
-        if num in text and not fut.done():
-            logger.info(f"✅ Matched {num}")
+    sender = await event.get_sender()
+    logger.info(f"📥 [From: {sender.username or sender.id}] {text[:200]}")
+    
+    # Extract any number (digits) from the message
+    numbers_in_msg = re.findall(r'\d{7,15}', text)
+    for num in numbers_in_msg:
+        normalized = normalize_number(num)
+        fut = pending.get(normalized)
+        if fut and not fut.done():
+            logger.info(f"✅ Matched pending request for {normalized}")
             fut.set_result(text)
-            break
+            return
 
 async def query(number: str) -> dict:
+    norm = normalize_number(number)
     # Check cache
-    entry = cache.get(number)
+    entry = cache.get(norm)
     if entry and time.time() - entry["time"] < CACHE_TTL:
         logger.info(f"Cache hit for {number}")
         return entry["data"]
+    
     # Send command
     fut = asyncio.get_event_loop().create_future()
-    pending[number] = fut
+    pending[norm] = fut
     cmd = f"/tgid {number}"
     logger.info(f"📤 {cmd}")
     await client.send_message(GROUP_ID, cmd)
+    
     try:
         resp = await asyncio.wait_for(fut, timeout=REQUEST_TIMEOUT)
         data = extract(resp)
         if data:
-            cache[number] = {"data": data, "time": time.time()}
+            cache[norm] = {"data": data, "time": time.time()}
             return data
         else:
-            logger.warning("Extraction failed")
+            logger.warning("Extraction failed – raw response: " + resp[:200])
             return None
     except asyncio.TimeoutError:
-        logger.warning(f"Timeout for {number}")
+        logger.warning(f"Timeout after {REQUEST_TIMEOUT}s for {number}")
         return None
     finally:
-        pending.pop(number, None)
+        pending.pop(norm, None)
 
 app = Quart(__name__)
 
 @app.before_serving
 async def startup():
     await client.start()
-    logger.info("✅ Client ready")
+    logger.info("✅ Client ready – listening to group ID: " + str(GROUP_ID))
 
 @app.after_serving
 async def shutdown():
@@ -131,7 +143,7 @@ async def captain_api():
         "status": "success",
         "query": num,
         "data": data,
-        "cached": (cache.get(num, {}).get("time", 0) > start - CACHE_TTL),
+        "cached": (cache.get(normalize_number(num), {}).get("time", 0) > start - CACHE_TTL),
         "response_ms": int((time.time() - start) * 1000)
     })
 
