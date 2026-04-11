@@ -1,4 +1,4 @@
 telethon
 quart
 python-dotenv
-werkzeug
+hypercorn
