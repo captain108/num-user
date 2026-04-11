@@ -3,6 +3,7 @@ import asyncio
 import time
 import re
 import random
+import threading
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -177,21 +178,37 @@ def lookup():
             "message": "Missing id"
         })
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    result = loop.run_until_complete(handle_query_api(value))
+    future = asyncio.run_coroutine_threadsafe(
+        handle_query_api(value),
+        MAIN_LOOP
+    )
+    
+    result = future.result()
 
     return jsonify(result)
 
-# ================= TELETHON START (FIX) =================
+# ================= TELETHON START =================
+
 def start_background_loop(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
+# create loop
 loop = asyncio.new_event_loop()
-import threading
-threading.Thread(target=start_background_loop, args=(loop,), daemon=True).start()
 
-# start telethon client
-asyncio.run_coroutine_threadsafe(client.start(), loop)
+# assign global loop
+MAIN_LOOP = loop
+
+# start loop thread
+threading.Thread(
+    target=start_background_loop,
+    args=(loop,),
+    daemon=True
+).start()
+
+# start telethon properly
+async def init_client():
+    await client.start()
+    print("✅ Telethon Started")
+
+asyncio.run_coroutine_threadsafe(init_client(), loop)
