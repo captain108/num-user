@@ -1,5 +1,4 @@
 telethon
 quart
-quart-limiter
 python-dotenv
 werkzeug
