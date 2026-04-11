@@ -185,7 +185,13 @@ def lookup():
     return jsonify(result)
 
 # ================= TELETHON START (FIX) =================
-@app.before_first_request
-def start_telethon():
-    loop = asyncio.get_event_loop()
-    loop.create_task(client.start())
+def start_background_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+loop = asyncio.new_event_loop()
+import threading
+threading.Thread(target=start_background_loop, args=(loop,), daemon=True).start()
+
+# start telethon client
+asyncio.run_coroutine_threadsafe(client.start(), loop)
