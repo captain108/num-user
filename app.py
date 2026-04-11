@@ -73,6 +73,7 @@ async def get_json_from_bot(number: str, command: str):
 
     cache_key = f"{command}:{number}"
 
+    # ================= CACHE =================
     if cache_key in cache:
         if time.time() - cache[cache_key]["time"] < CACHE_TTL:
             logger.info(f"⚡ Cache hit {cache_key}")
@@ -82,33 +83,42 @@ async def get_json_from_bot(number: str, command: str):
     logger.info(f"📤 Sending: {cmd}")
 
     start_time = time.time()
-    await client.send_message(GROUP_ID, cmd)
 
     try:
-        # ✅ STEP 1: WAIT BOT MESSAGE (FIXED)
+        # ================= STEP 1: CAPTURE BOT MESSAGE =================
         future = asyncio.get_event_loop().create_future()
 
-        async def handler(event):
+        async def handler_msg(event):
             if event.chat_id != GROUP_ID:
                 return
-        
+
             if event.date.timestamp() < start_time:
                 return
-    
+
+            sender = await event.get_sender()
+            if not sender or not sender.bot:
+                return
+
             if event.message and (event.message.raw_text or event.message.reply_markup):
                 if not future.done():
                     future.set_result(event)
-        
-        client.add_event_handler(handler, events.NewMessage)
-        
+
+        # ✅ ADD handler BEFORE sending
+        client.add_event_handler(handler_msg, events.NewMessage)
+
+        # ✅ SEND command
+        await client.send_message(GROUP_ID, cmd)
+
+        # ✅ WAIT response
         info_msg = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
-        
-        client.remove_event_handler(handler)
-        
+
+        # ✅ REMOVE handler
+        client.remove_event_handler(handler_msg)
+
         msg = info_msg.message
         logger.info("📥 Got response message")
 
-        # ✅ STEP 2: FIND JSON BUTTON
+        # ================= STEP 2: FIND JSON BUTTON =================
         target_button = None
         if msg.reply_markup:
             for row in msg.reply_markup.rows:
@@ -123,33 +133,40 @@ async def get_json_from_bot(number: str, command: str):
             logger.warning("❌ JSON button not found")
             return None
 
-        # ✅ STEP 3: CLICK BUTTON
+        # ================= STEP 3: PREPARE JSON LISTENER =================
+        future = asyncio.get_event_loop().create_future()
+
+        async def handler_json(event):
+            if event.chat_id != GROUP_ID:
+                return
+
+            if event.date.timestamp() < start_time:
+                return
+
+            if (
+                event.document and
+                event.document.mime_type == "application/json" and
+                event.date.timestamp() >= start_time
+            ):
+                if not future.done():
+                    future.set_result(event)
+
+        # ✅ ADD handler BEFORE click
+        client.add_event_handler(handler_json, events.NewMessage)
+
+        # ================= STEP 4: CLICK BUTTON =================
         await msg.click(text=target_button.text)
         logger.info("🔘 Clicked JSON")
 
-        # ✅ STEP 4: WAIT JSON FILE (FIXED)
-        future = asyncio.get_event_loop().create_future()
-
-        async def handler(event):
-            if event.chat_id != GROUP_ID:
-                return
-        
-            if event.date.timestamp() < start_time:
-                return
-        
-            if event.document and event.document.mime_type == "application/json":
-                if not future.done():
-                    future.set_result(event)
-        
-        client.add_event_handler(handler, events.NewMessage)
-        
+        # ================= STEP 5: WAIT JSON =================
         file_msg = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
-        
-        client.remove_event_handler(handler)
-        
+
+        # ✅ REMOVE handler
+        client.remove_event_handler(handler_json)
+
         logger.info("📎 JSON received")
 
-        # ✅ STEP 5: DOWNLOAD
+        # ================= STEP 6: DOWNLOAD =================
         content = await client.download_media(file_msg.message, bytes)
         raw_data = json.loads(content.decode())
 
@@ -169,7 +186,6 @@ async def get_json_from_bot(number: str, command: str):
     except Exception as e:
         logger.error(f"❌ Error: {e}")
         return None
-
 # ================= APP =================
 app = Quart(__name__)
 
