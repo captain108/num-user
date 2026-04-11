@@ -2,6 +2,7 @@ import os
 import asyncio
 import time
 import json
+import uuid
 import logging
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -9,8 +10,9 @@ from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from quart import Quart, request, jsonify
 
+# ================= SETUP =================
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tg-lookup")
+logger = logging.getLogger("tg-api")
 
 load_dotenv()
 
@@ -23,180 +25,206 @@ API_KEY = os.getenv("API_KEY", "pak_captain123")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
 CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
 
-# Rate limiting
+# ================= RATE LIMIT =================
 rate_limit = defaultdict(list)
-RATE_LIMIT = 10
+RATE_LIMIT = 15
 RATE_LIMIT_PERIOD = 60
 
-def is_rate_limited(ip: str) -> bool:
+def is_rate_limited(ip):
     now = time.time()
     times = rate_limit[ip]
+
     while times and times[0] < now - RATE_LIMIT_PERIOD:
         times.pop(0)
+
     if len(times) >= RATE_LIMIT:
         return True
+
     times.append(now)
     return False
 
+# ================= CLIENT =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 cache = {}
 
-def clean_json(data: dict) -> dict:
-    """Remove unwanted fields like cached, proxyUsed, attempt, credits, etc."""
+# ================= CLEAN JSON =================
+def clean_json(data):
+    remove_keys = ["cached", "proxyUsed", "attempt", "cached_at", "credits"]
+
     if not isinstance(data, dict):
         return data
-    remove_keys = ["cached", "proxyUsed", "attempt", "cached_at", "by", "Credits Left", "credits"]
+
     cleaned = {}
     for k, v in data.items():
         if k in remove_keys:
             continue
+
         if isinstance(v, dict):
             cleaned[k] = clean_json(v)
         elif isinstance(v, list):
-            cleaned[k] = [clean_json(item) for item in v]
+            cleaned[k] = [clean_json(x) for x in v]
         else:
             cleaned[k] = v
+
     return cleaned
 
-async def get_json_from_bot(number: str, command: str) -> dict:
+# ================= CORE FUNCTION =================
+async def get_json_from_bot(number: str, command: str):
+
     cache_key = f"{command}:{number}"
-    entry = cache.get(cache_key)
-    if entry and time.time() - entry["time"] < CACHE_TTL:
-        logger.info(f"Cache hit for {cache_key}")
-        return entry["data"]
 
-    me = await client.get_me()
-    my_id = me.id
+    if cache_key in cache:
+        if time.time() - cache[cache_key]["time"] < CACHE_TTL:
+            logger.info(f"⚡ Cache hit {cache_key}")
+            return cache[cache_key]["data"]
 
-    cmd = f"{command} {number}"
-    logger.info(f"📤 Sending {cmd}")
+    req_id = str(uuid.uuid4())[:6]
+    cmd = f"{command} {number} {req_id}"
+
+    logger.info(f"📤 Sending: {cmd}")
     await client.send_message(GROUP_ID, cmd)
 
     try:
-        # Wait for the bot's info message (contains number and buttons)
+        # STEP 1: WAIT CORRECT MESSAGE (ISOLATED)
         info_msg = await client.wait_for(
             events.NewMessage(chats=GROUP_ID),
             timeout=REQUEST_TIMEOUT,
-            condition=lambda e: number in e.raw_text and e.sender_id != my_id
+            condition=lambda e: (
+                e.raw_text and
+                number in e.raw_text and
+                req_id in e.raw_text
+            )
         )
+
         msg = info_msg.message
+        logger.info("📥 Got response message")
 
-        # Find "Download JSON" button
-        if not msg.reply_markup or not msg.reply_markup.rows:
-            logger.error("No buttons found")
-            return None
-
+        # STEP 2: FIND JSON BUTTON
         target_button = None
-        for row in msg.reply_markup.rows:
-            for btn in row.buttons:
-                if "JSON" in btn.text:
-                    target_button = btn
+        if msg.reply_markup:
+            for row in msg.reply_markup.rows:
+                for btn in row.buttons:
+                    if "json" in btn.text.lower():
+                        target_button = btn
+                        break
+                if target_button:
                     break
-            if target_button:
-                break
 
         if not target_button:
-            logger.error("No 'Download JSON' button")
+            logger.warning("❌ JSON button not found")
             return None
 
-        logger.info(f"🔘 Clicking button: {target_button.text}")
-        await client.click(msg, target_button)
+        # STEP 3: CLICK BUTTON
+        await msg.click(text=target_button.text)
+        logger.info("🔘 Clicked JSON")
 
-        # Wait for the JSON file
+        # STEP 4: WAIT JSON FILE
         file_msg = await client.wait_for(
             events.NewMessage(chats=GROUP_ID),
             timeout=REQUEST_TIMEOUT,
-            condition=lambda e: e.document and e.document.mime_type == "application/json"
+            condition=lambda e: (
+                e.document and
+                e.document.mime_type == "application/json"
+            )
         )
 
-        file_content = await client.download_media(file_msg.message, bytes)
-        raw_data = json.loads(file_content.decode('utf-8'))
+        logger.info("📎 JSON received")
+
+        # STEP 5: DOWNLOAD + CLEAN
+        content = await client.download_media(file_msg.message, bytes)
+        raw_data = json.loads(content.decode())
+
         cleaned = clean_json(raw_data)
-        cache[cache_key] = {"data": cleaned, "time": time.time()}
+
+        cache[cache_key] = {
+            "data": cleaned,
+            "time": time.time()
+        }
+
         return cleaned
 
     except asyncio.TimeoutError:
-        logger.warning(f"Timeout after {REQUEST_TIMEOUT}s for {command} {number}")
-        return None
-    except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.warning("⏱ Timeout")
         return None
 
-# ================= QUART APP =================
+    except Exception as e:
+        logger.error(f"❌ Error: {e}")
+        return None
+
+# ================= APP =================
 app = Quart(__name__)
 
 @app.before_serving
 async def startup():
     await client.start()
-    logger.info("✅ Telethon client ready")
-
-@app.after_serving
-async def shutdown():
-    await client.disconnect()
+    logger.info("✅ Telethon Connected")
 
 @app.route("/")
 async def home():
     return jsonify({"status": "running", "connected": client.is_connected()})
 
+# ================= /num =================
 @app.route("/num")
-async def num_endpoint():
+async def num_api():
+
     ip = request.remote_addr
+
     if is_rate_limited(ip):
-        return jsonify({"error": "Rate limit exceeded"}), 429
+        return jsonify({"error": "Rate limit"}), 429
 
-    key = request.args.get("key")
-    if key != API_KEY:
-        return jsonify({"error": "Invalid API key"}), 401
+    if request.args.get("key") != API_KEY:
+        return jsonify({"error": "Invalid key"}), 401
 
-    num = request.args.get("num")
-    if not num:
-        return jsonify({"error": "Missing 'num' parameter"}), 400
-
-    if not client.is_connected():
-        return jsonify({"error": "Telegram client not ready"}), 503
+    number = request.args.get("num")
+    if not number:
+        return jsonify({"error": "Missing num"}), 400
 
     start = time.time()
-    data = await get_json_from_bot(num, "/num")
+
+    data = await get_json_from_bot(number, "/num")
+
     if not data:
-        return jsonify({"status": "error", "message": "No JSON received"}), 404
+        return jsonify({"status": "error", "message": "No data"}), 404
 
     return jsonify({
         "status": "success",
-        "query": num,
-        "command": "num",
+        "type": "num",
+        "query": number,
         "data": data,
         "response_time_ms": int((time.time() - start) * 1000)
     })
 
+# ================= /tg =================
 @app.route("/tg")
-async def tg_endpoint():
+async def tg_api():
+
     ip = request.remote_addr
+
     if is_rate_limited(ip):
-        return jsonify({"error": "Rate limit exceeded"}), 429
+        return jsonify({"error": "Rate limit"}), 429
 
-    key = request.args.get("key")
-    if key != API_KEY:
-        return jsonify({"error": "Invalid API key"}), 401
+    if request.args.get("key") != API_KEY:
+        return jsonify({"error": "Invalid key"}), 401
 
-    num = request.args.get("num")
-    if not num:
-        return jsonify({"error": "Missing 'num' parameter"}), 400
-
-    if not client.is_connected():
-        return jsonify({"error": "Telegram client not ready"}), 503
+    number = request.args.get("num")
+    if not number:
+        return jsonify({"error": "Missing num"}), 400
 
     start = time.time()
-    data = await get_json_from_bot(num, "/tgid")
+
+    data = await get_json_from_bot(number, "/tgid")
+
     if not data:
-        return jsonify({"status": "error", "message": "No JSON received"}), 404
+        return jsonify({"status": "error", "message": "No data"}), 404
 
     return jsonify({
         "status": "success",
-        "query": num,
-        "command": "tgid",
+        "type": "tgid",
+        "query": number,
         "data": data,
         "response_time_ms": int((time.time() - start) * 1000)
     })
 
+# ================= RUN =================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
