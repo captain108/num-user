@@ -1,7 +1,5 @@
 import os
 import asyncio
-import time
-import json
 import logging
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
@@ -13,125 +11,122 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-api")
 load_dotenv()
 
+# Environment Variables Load
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 API_KEY = os.getenv("API_KEY")
 
-# Render ke liye 28s safe limit
+# Remove '@' if Papaji accidentally added it in .env
+NX_BOT = os.getenv("NX_BOT_USERNAME").replace("@", "")
+UNKNOWN_BOT = os.getenv("UNKNOWN_BOT_USERNAME").replace("@", "")
+
+# Render free tier safe limit
 REQUEST_TIMEOUT = 28 
 
 # ================= CLIENT & LOCK =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-engine_lock = asyncio.Lock()
+engine_lock = asyncio.Lock()  # Prevents overlapping requests (Anti-Spam)
 
-# ================= CORE ENGINE =================
-async def get_json_from_bot(number: str, command: str):
+# ================= CORE ENGINE (THE SMART SCRAPER) =================
+async def get_raw_text_from_group(query: str, command: str, target_bot_username: str):
     async with engine_lock: 
-        logger.info(f"🚀 MISSION START: Searching {number}")
+        logger.info(f"🚀 MISSION: {command} {query} | Target Lock: {target_bot_username}")
         
         if not client.is_connected():
             await client.connect()
 
         try:
-            # 1. SEND COMMAND
-            await client.send_message(GROUP_ID, f".\n{command} {number}")
+            # 1. SEND COMMAND (Papaji's Format: Dot + Newline + Command)
+            sent_msg = await client.send_message(GROUP_ID, f".\n{command} {query}")
             
             bot_msg_future = asyncio.get_event_loop().create_future()
 
-            # 2. BOT MESSAGE LISTENER
+            # 2. STRICT SENDER LISTENER (Ignores Wrong Bots)
             async def handler_msg(event):
-                if event.chat_id == GROUP_ID and number in event.message.raw_text:
-                    if not bot_msg_future.done():
-                        bot_msg_future.set_result(event.message)
+                if event.chat_id == GROUP_ID:
+                    sender = await event.get_sender()
+                    
+                    # Verify if the sender is exactly the bot we want
+                    if sender and sender.username and sender.username.lower() == target_bot_username.lower():
+                        text = event.message.raw_text.lower()
+                        
+                        # Match Logic: Is it a reply to our command? Or does it contain the query?
+                        is_reply = event.reply_to_msg_id == sent_msg.id
+                        has_query = query.lower() in text
+                        
+                        if is_reply or has_query:
+                            if not bot_msg_future.done():
+                                # We capture the EXACT text with formatting
+                                bot_msg_future.set_result(event.message.raw_text)
 
             client.add_event_handler(handler_msg, events.NewMessage)
 
             try:
-                bot_msg = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
-                logger.info("✅ Bot Response Captured!")
-            except asyncio.TimeoutError:
-                return {"status": "failed", "msg": "Bot response timeout"}
-            finally:
-                client.remove_event_handler(handler_msg)
-
-            # 3. FIND BUTTON INDEX (Row/Col logic)
-            row_idx, col_idx = None, None
-            if bot_msg.reply_markup:
-                for r, row in enumerate(bot_msg.reply_markup.rows):
-                    for c, btn in enumerate(row.buttons):
-                        if "json" in btn.text.lower():
-                            row_idx, col_idx = r, c
-                            break
-            
-            if row_idx is None:
-                return {"status": "failed", "msg": "Download JSON Button not found"}
-
-            # 4. DOWNLOAD LISTENER (Active BEFORE Click)
-            file_future = asyncio.get_event_loop().create_future()
-
-            async def handler_file(event):
-                if event.chat_id == GROUP_ID and event.document:
-                    if event.document.mime_type == "application/json":
-                        if not file_future.done():
-                            file_future.set_result(event)
-
-            client.add_event_handler(handler_file, events.NewMessage)
-
-            try:
-                # Papaji, click karne se pehle 1.5 second ka gap (Safety)
-                await asyncio.sleep(1.5)
+                # Wait for the specific bot to drop the data
+                raw_text = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
+                logger.info(f"✅ Target Eliminated! Data Captured from {target_bot_username}")
                 
-                # Precise Index-based Click
-                await bot_msg.click(row_idx, col_idx)
-                logger.info(f"🔘 Clicked Button at Row {row_idx}, Col {col_idx}")
-                
-                # Wait for file
-                file_event = await asyncio.wait_for(file_future, timeout=REQUEST_TIMEOUT)
-                logger.info("📎 JSON File Received!")
-                
-                content = await client.download_media(file_event.message, bytes)
-                raw_data = json.loads(content.decode())
-                
-                return {"status": "success", "data": raw_data}
+                return {
+                    "status": "success", 
+                    "data": {
+                        "raw_response": raw_text
+                    }
+                }
                 
             except asyncio.TimeoutError:
-                return {"status": "failed", "msg": "Bot did not send file after click"}
+                logger.warning(f"⏳ Timeout: {target_bot_username} is sleeping or dead.")
+                return {"status": "failed", "msg": f"Timeout: {target_bot_username} did not respond"}
             finally:
-                client.remove_event_handler(handler_file)
+                client.remove_event_handler(handler_msg) # Clean up memory
 
         except Exception as e:
-            logger.error(f"❌ Critical Error: {str(e)}")
+            logger.error(f"❌ System Error: {str(e)}")
             return {"status": "failed", "msg": str(e)}
 
-# ================= WEB APP =================
+# ================= WEB APP ROUTER =================
 app = Quart(__name__)
 
 @app.before_serving
 async def startup():
     await client.start()
-    logger.info("🚀 PAPAJI BRIDGE V6.0 ONLINE")
+    logger.info("🚀 PAPAJI'S ULTIMATE ROUTER V9.0 ONLINE")
 
 @app.route("/api")
 async def api_router():
+    # Security Gate
     if request.args.get("key") != API_KEY:
-        return jsonify({"status": "failed", "msg": "Invalid Key"}), 401
+        return jsonify({"status": "failed", "msg": "Access Denied: Invalid Key"}), 401
     
-    num = request.args.get("num")
+    query = request.args.get("query") 
     method = request.args.get("method")
     
-    if not num or not method:
-        return jsonify({"status": "failed", "msg": "Missing params"}), 400
+    if not query or not method:
+        return jsonify({"status": "failed", "msg": "Missing 'query' or 'method' parameters"}), 400
 
-    cmd = "/num" if method == "num" else "/tgid"
-    result = await get_json_from_bot(num, cmd)
+    # THE BRAIN: Target Selection Logic
+    if method == "num":
+        cmd = "/num"
+        target_bot = NX_BOT
+    elif method == "tgid":
+        cmd = "/tgid"
+        target_bot = NX_BOT
+    elif method == "tg":
+        cmd = "/tg"
+        target_bot = UNKNOWN_BOT
+    else:
+        return jsonify({"status": "failed", "msg": "Invalid method. Use 'num', 'tgid', or 'tg'"}), 400
+
+    # Fire the Engine
+    result = await get_raw_text_from_group(query, cmd, target_bot)
     
     if not result:
-        return jsonify({"status": "failed", "msg": "Internal Error"}), 500
+        return jsonify({"status": "failed", "msg": "Critical Internal Error"}), 500
     
     return jsonify(result)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
+    # Uvicorn is recommended for production, but app.run is fine for simple hosting
     app.run(host="0.0.0.0", port=port)
