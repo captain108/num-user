@@ -2,8 +2,8 @@ import os
 import asyncio
 import time
 import json
-import uuid
 import logging
+import uuid
 from collections import defaultdict
 from dotenv import load_dotenv
 from telethon import TelegramClient, events
@@ -13,7 +13,6 @@ from quart import Quart, request, jsonify
 # ================= SETUP =================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("tg-api")
-
 load_dotenv()
 
 API_ID = int(os.getenv("API_ID"))
@@ -22,26 +21,8 @@ STRING_SESSION = os.getenv("STRING_SESSION")
 GROUP_ID = int(os.getenv("GROUP_ID"))
 API_KEY = os.getenv("API_KEY", "pak_captain123")
 
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
-CACHE_TTL = int(os.getenv("CACHE_TTL", 60))
-
-# ================= RATE LIMIT =================
-rate_limit = defaultdict(list)
-RATE_LIMIT = 15
-RATE_LIMIT_PERIOD = 60
-
-def is_rate_limited(ip):
-    now = time.time()
-    times = rate_limit[ip]
-
-    while times and times[0] < now - RATE_LIMIT_PERIOD:
-        times.pop(0)
-
-    if len(times) >= RATE_LIMIT:
-        return True
-
-    times.append(now)
-    return False
+REQUEST_TIMEOUT = 45 # Thoda extra time for slow bots
+CACHE_TTL = 120      # 2 Minutes cache
 
 # ================= CLIENT =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
@@ -49,217 +30,124 @@ cache = {}
 
 # ================= CLEAN JSON =================
 def clean_json(data):
-    remove_keys = ["cached", "proxyUsed", "attempt", "cached_at", "credits"]
-
-    if not isinstance(data, dict):
-        return data
-
+    remove_keys = ["cached", "proxyUsed", "attempt", "cached_at", "credits", "execution_time"]
+    if not isinstance(data, dict): return data
     cleaned = {}
     for k, v in data.items():
-        if k in remove_keys:
-            continue
-
-        if isinstance(v, dict):
-            cleaned[k] = clean_json(v)
-        elif isinstance(v, list):
-            cleaned[k] = [clean_json(x) for x in v]
-        else:
-            cleaned[k] = v
-
+        if k in remove_keys: continue
+        if isinstance(v, dict): cleaned[k] = clean_json(v)
+        elif isinstance(v, list): cleaned[k] = [clean_json(x) for x in v]
+        else: cleaned[k] = v
     return cleaned
 
-# ================= CORE FUNCTION =================
+# ================= CORE ENGINE (THE PAPAJI LOGIC) =================
 async def get_json_from_bot(number: str, command: str):
-
     cache_key = f"{command}:{number}"
+    
+    if cache_key in cache and (time.time() - cache[cache_key]["time"] < CACHE_TTL):
+        logger.info(f"⚡ Cache Hit: {cache_key}")
+        return cache[cache_key]["data"]
 
-    # ================= CACHE =================
-    if cache_key in cache:
-        if time.time() - cache[cache_key]["time"] < CACHE_TTL:
-            logger.info(f"⚡ Cache hit {cache_key}")
-            return cache[cache_key]["data"]
-
-    cmd = f"{command} {number}"
-    logger.info(f"📤 Sending: {cmd}")
-
-    start_time = time.time()
+    cmd_text = f"{command} {number}"
+    logger.info(f"📤 Sending Command: {cmd_text}")
 
     try:
-        # ================= STEP 1: CAPTURE BOT MESSAGE =================
-        future = asyncio.get_event_loop().create_future()
+        # 1. SEND MESSAGE & GET ID
+        sent_msg = await client.send_message(GROUP_ID, cmd_text)
+        sent_msg_id = sent_msg.id
+        
+        # 2. CAPTURE REPLY MESSAGE (The Bot Response)
+        reply_msg_future = asyncio.get_event_loop().create_future()
 
         async def handler_msg(event):
-            if event.chat_id != GROUP_ID:
-                return
+            # Only listen to replies of OUR specific message
+            if event.chat_id == GROUP_ID and event.reply_to_msg_id == sent_msg_id:
+                if not reply_msg_future.done():
+                    reply_msg_future.set_result(event.message)
 
-            if event.date.timestamp() < start_time - 2:
-                return
-
-            sender = await event.get_sender()
-            if not sender or not sender.bot:
-                return
-
-            if event.message and (event.message.raw_text or event.message.reply_markup):
-                if not future.done():
-                    future.set_result(event)
-
-        # ✅ ADD handler BEFORE sending
         client.add_event_handler(handler_msg, events.NewMessage)
 
-        # ✅ SEND command
-        await client.send_message(GROUP_ID, cmd)
+        try:
+            bot_msg = await asyncio.wait_for(reply_msg_future, timeout=REQUEST_TIMEOUT)
+        finally:
+            client.remove_event_handler(handler_msg)
 
-        # ✅ WAIT response
-        info_msg = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
-
-        # ✅ REMOVE handler
-        client.remove_event_handler(handler_msg)
-
-        msg = info_msg.message
-        logger.info("📥 Got response message")
-
-        # ================= STEP 2: FIND JSON BUTTON =================
+        # 3. FIND JSON BUTTON & CLICK
         target_button = None
-        if msg.reply_markup:
-            for row in msg.reply_markup.rows:
+        if bot_msg.reply_markup:
+            for row in bot_msg.reply_markup.rows:
                 for btn in row.buttons:
                     if "json" in btn.text.lower():
                         target_button = btn
                         break
-                if target_button:
-                    break
-
+            
         if not target_button:
-            logger.warning("❌ JSON button not found")
-            return None
+            return {"error": "JSON Button not found in bot response"}
 
-        # ================= STEP 3: PREPARE JSON LISTENER =================
-        future = asyncio.get_event_loop().create_future()
+        # 4. CAPTURE FILE (The JSON Document)
+        file_future = asyncio.get_event_loop().create_future()
 
-        async def handler_json(event):
-            if event.chat_id != GROUP_ID:
-                return
-        
-            # 🔥 small buffer (important)
-            if event.date.timestamp() < start_time - 2:
-                return
-        
-            sender = await event.get_sender()
-            if not sender or not sender.bot:
-                return
-        
-            if event.document and event.document.mime_type == "application/json":
-                if not future.done():
-                    future.set_result(event)
-        # ✅ ADD handler BEFORE click
-        client.add_event_handler(handler_json, events.NewMessage)
+        async def handler_file(event):
+            # Bot typically sends the file as a new message, often replying to its own previous message
+            # Or just sent in the same group. We filter by document type.
+            if event.chat_id == GROUP_ID and event.document:
+                if event.document.mime_type == "application/json":
+                    # Check if it was sent after our click (time filter)
+                    if not file_future.done():
+                        file_future.set_result(event)
 
-        # ================= STEP 4: CLICK BUTTON =================
-        await msg.click(text=target_button.text)
-        logger.info("🔘 Clicked JSON")
+        client.add_event_handler(handler_file, events.NewMessage)
 
-        # ================= STEP 5: WAIT JSON =================
-        file_msg = await asyncio.wait_for(future, timeout=REQUEST_TIMEOUT)
+        try:
+            await bot_msg.click(text=target_button.text)
+            logger.info("🔘 Clicked JSON Button")
+            
+            file_event = await asyncio.wait_for(file_future, timeout=REQUEST_TIMEOUT)
+            content = await client.download_media(file_event.message, bytes)
+            raw_data = json.loads(content.decode())
+            
+            cleaned = clean_json(raw_data)
+            cache[cache_key] = {"data": cleaned, "time": time.time()}
+            return cleaned
 
-        # ✅ REMOVE handler
-        client.remove_event_handler(handler_json)
-
-        logger.info("📎 JSON received")
-
-        # ================= STEP 6: DOWNLOAD =================
-        content = await client.download_media(file_msg.message, bytes)
-        raw_data = json.loads(content.decode())
-
-        cleaned = clean_json(raw_data)
-
-        cache[cache_key] = {
-            "data": cleaned,
-            "time": time.time()
-        }
-
-        return cleaned
-
-    except asyncio.TimeoutError:
-        logger.warning("⏱ Timeout")
-        return None
+        finally:
+            client.remove_event_handler(handler_file)
 
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
+        logger.error(f"❌ Engine Error: {e}")
         return None
-# ================= APP =================
+
+# ================= WEB APP =================
 app = Quart(__name__)
 
 @app.before_serving
 async def startup():
     await client.start()
-    logger.info("✅ Telethon Connected")
+    logger.info("🚀 PAPAJI BRIDGE ENGINE ONLINE")
 
-@app.route("/")
-async def home():
-    return jsonify({"status": "running", "connected": client.is_connected()})
+@app.route("/api")
+async def api_router():
+    key = request.args.get("key")
+    num = request.args.get("num")
+    method = request.args.get("method") # 'num' or 'tg'
 
-# ================= /num =================
-@app.route("/num")
-async def num_api():
+    if key != API_KEY: return jsonify({"error": "Unauthorized"}), 401
+    if not num or not method: return jsonify({"error": "Missing params"}), 400
 
-    ip = request.remote_addr
-
-    if is_rate_limited(ip):
-        return jsonify({"error": "Rate limit"}), 429
-
-    if request.args.get("key") != API_KEY:
-        return jsonify({"error": "Invalid key"}), 401
-
-    number = request.args.get("num")
-    if not number:
-        return jsonify({"error": "Missing num"}), 400
-
-    start = time.time()
-
-    data = await get_json_from_bot(number, "/num")
-
-    if not data:
-        return jsonify({"status": "error", "message": "No data"}), 404
-
+    cmd = "/num" if method == "num" else "/tgid"
+    start_time = time.time()
+    
+    data = await get_json_from_bot(num, cmd)
+    
+    if not data: return jsonify({"status": "failed", "msg": "Timeout or Bot Error"}), 504
+    
     return jsonify({
         "status": "success",
-        "type": "num",
-        "query": number,
+        "query": num,
+        "method": method,
         "data": data,
-        "response_time_ms": int((time.time() - start) * 1000)
+        "elapsed": f"{round(time.time() - start_time, 2)}s"
     })
 
-# ================= /tg =================
-@app.route("/tg")
-async def tg_api():
-
-    ip = request.remote_addr
-
-    if is_rate_limited(ip):
-        return jsonify({"error": "Rate limit"}), 429
-
-    if request.args.get("key") != API_KEY:
-        return jsonify({"error": "Invalid key"}), 401
-
-    number = request.args.get("num")
-    if not number:
-        return jsonify({"error": "Missing num"}), 400
-
-    start = time.time()
-
-    data = await get_json_from_bot(number, "/tgid")
-
-    if not data:
-        return jsonify({"status": "error", "message": "No data"}), 404
-
-    return jsonify({
-        "status": "success",
-        "type": "tgid",
-        "query": number,
-        "data": data,
-        "response_time_ms": int((time.time() - start) * 1000)
-    })
-
-# ================= RUN =================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
