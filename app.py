@@ -16,15 +16,14 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
-GROUP_ID = int(os.getenv("GROUP_ID"))
+# GROUP_ID ab sirf message bhejne ke kaam aayega
+GROUP_ID = int(os.getenv("GROUP_ID")) 
 API_KEY = os.getenv("API_KEY")
 
-# Render limits ke liye optimized (Render kills at 30s)
 REQUEST_TIMEOUT = 28 
 
 # ================= CLIENT & LOCK =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-# Ye lock spam rokega. Ek baar mein ek hi ID search hogi.
 engine_lock = asyncio.Lock()
 
 # ================= CLEAN JSON =================
@@ -41,7 +40,7 @@ def clean_json(data):
 
 # ================= CORE ENGINE =================
 async def get_json_from_bot(number: str, command: str):
-    async with engine_lock: # Prevent overlapping requests
+    async with engine_lock: 
         logger.info(f"🚀 MISSION START: {number}")
         
         if not client.is_connected():
@@ -49,24 +48,25 @@ async def get_json_from_bot(number: str, command: str):
 
         try:
             # 1. SEND COMMAND
-            await client.send_message(GROUP_ID, f"{command} {number}")
+            # (Papaji, maine dekha aap . aur new line use kar rahe the, maine waisa hi format de diya)
+            await client.send_message(GROUP_ID, f".\n{command} {number}")
             
             bot_msg_future = asyncio.get_event_loop().create_future()
 
-            # 2. BOT RESPONSE LISTENER
+            # 2. GREEDY BOT RESPONSE LISTENER (Bypass Chat ID Match)
             async def handler_msg(event):
-                # Check Group ID + Ensure the number is in the bot's reply text
-                if event.chat_id == GROUP_ID and number in event.message.raw_text:
-                    sender = await event.get_sender()
-                    if sender and sender.bot:
-                        if not bot_msg_future.done():
-                            bot_msg_future.set_result(event.message)
+                text = str(event.message.message)
+                # Agar message mein number hai AUR usme Inline Buttons (reply_markup) hain
+                # Toh 100% yehi bot ka reply hai!
+                if str(number) in text and event.message.reply_markup:
+                    if not bot_msg_future.done():
+                        bot_msg_future.set_result(event.message)
 
             client.add_event_handler(handler_msg, events.NewMessage)
 
             try:
                 bot_msg = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
-                logger.info("📥 Bot response matched successfully!")
+                logger.info("📥 Greedy Listener Caught the Bot Response!")
             except asyncio.TimeoutError:
                 return {"status": "failed", "msg": "Bot did not respond in time"}
             finally:
@@ -74,24 +74,23 @@ async def get_json_from_bot(number: str, command: str):
 
             # 3. JSON BUTTON SEARCH
             target_button = None
-            if bot_msg.reply_markup:
-                for row in bot_msg.reply_markup.rows:
-                    for btn in row.buttons:
-                        if "json" in btn.text.lower():
-                            target_button = btn
-                            break
+            for row in bot_msg.reply_markup.rows:
+                for btn in row.buttons:
+                    if "json" in btn.text.lower():
+                        target_button = btn
+                        break
             
             if not target_button:
                 return {"status": "failed", "msg": "JSON Button missing in bot response"}
 
-            # 4. DOWNLOAD LISTENER & BUTTON CLICK
+            # 4. GREEDY DOWNLOAD LISTENER & BUTTON CLICK
             file_future = asyncio.get_event_loop().create_future()
 
             async def handler_file(event):
-                if event.chat_id == GROUP_ID and event.document:
-                    if event.document.mime_type == "application/json":
-                        if not file_future.done():
-                            file_future.set_result(event)
+                # Jaise hi koi JSON file aaye usko grab karlo
+                if event.document and event.document.mime_type == "application/json":
+                    if not file_future.done():
+                        file_future.set_result(event)
 
             client.add_event_handler(handler_file, events.NewMessage)
 
@@ -121,11 +120,10 @@ app = Quart(__name__)
 @app.before_serving
 async def startup():
     await client.start()
-    logger.info("🚀 ENGINE LOADED - READY FOR PAPAJI")
+    logger.info("🚀 ENGINE LOADED - GREEDY MODE AKTIVE")
 
 @app.route("/api")
 async def api_router():
-    # Security Key Check
     if request.args.get("key") != API_KEY:
         return jsonify({"status": "failed", "msg": "Invalid Key"}), 401
     
@@ -133,7 +131,7 @@ async def api_router():
     method = request.args.get("method")
     
     if not num or not method:
-        return jsonify({"status": "failed", "msg": "Missing 'num' or 'method' params"}), 400
+        return jsonify({"status": "failed", "msg": "Missing params"}), 400
 
     cmd = "/num" if method == "num" else "/tgid"
     result = await get_json_from_bot(num, cmd)
@@ -144,6 +142,5 @@ async def api_router():
     return jsonify(result)
 
 if __name__ == "__main__":
-    # Render assigns dynamic PORT
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
