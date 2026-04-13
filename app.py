@@ -16,49 +16,33 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 STRING_SESSION = os.getenv("STRING_SESSION")
-# GROUP_ID ab sirf message bhejne ke kaam aayega
-GROUP_ID = int(os.getenv("GROUP_ID")) 
+GROUP_ID = int(os.getenv("GROUP_ID"))
 API_KEY = os.getenv("API_KEY")
 
+# Render ke liye 28s safe limit
 REQUEST_TIMEOUT = 28 
 
 # ================= CLIENT & LOCK =================
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 engine_lock = asyncio.Lock()
 
-# ================= CLEAN JSON =================
-def clean_json(data):
-    remove_keys = ["cached", "proxyUsed", "attempt", "cached_at", "credits"]
-    if not isinstance(data, dict): return data
-    cleaned = {}
-    for k, v in data.items():
-        if k in remove_keys: continue
-        if isinstance(v, dict): cleaned[k] = clean_json(v)
-        elif isinstance(v, list): cleaned[k] = [clean_json(x) for x in v]
-        else: cleaned[k] = v
-    return cleaned
-
 # ================= CORE ENGINE =================
 async def get_json_from_bot(number: str, command: str):
     async with engine_lock: 
-        logger.info(f"🚀 MISSION START: {number}")
+        logger.info(f"🚀 MISSION START: Searching {number}")
         
         if not client.is_connected():
             await client.connect()
 
         try:
             # 1. SEND COMMAND
-            # (Papaji, maine dekha aap . aur new line use kar rahe the, maine waisa hi format de diya)
             await client.send_message(GROUP_ID, f".\n{command} {number}")
             
             bot_msg_future = asyncio.get_event_loop().create_future()
 
-            # 2. GREEDY BOT RESPONSE LISTENER (Bypass Chat ID Match)
+            # 2. BOT MESSAGE LISTENER
             async def handler_msg(event):
-                text = str(event.message.message)
-                # Agar message mein number hai AUR usme Inline Buttons (reply_markup) hain
-                # Toh 100% yehi bot ka reply hai!
-                if str(number) in text and event.message.reply_markup:
+                if event.chat_id == GROUP_ID and number in event.message.raw_text:
                     if not bot_msg_future.done():
                         bot_msg_future.set_result(event.message)
 
@@ -66,52 +50,59 @@ async def get_json_from_bot(number: str, command: str):
 
             try:
                 bot_msg = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
-                logger.info("📥 Greedy Listener Caught the Bot Response!")
+                logger.info("✅ Bot Response Captured!")
             except asyncio.TimeoutError:
-                return {"status": "failed", "msg": "Bot did not respond in time"}
+                return {"status": "failed", "msg": "Bot response timeout"}
             finally:
                 client.remove_event_handler(handler_msg)
 
-            # 3. JSON BUTTON SEARCH
-            target_button = None
-            for row in bot_msg.reply_markup.rows:
-                for btn in row.buttons:
-                    if "json" in btn.text.lower():
-                        target_button = btn
-                        break
+            # 3. FIND BUTTON INDEX (Row/Col logic)
+            row_idx, col_idx = None, None
+            if bot_msg.reply_markup:
+                for r, row in enumerate(bot_msg.reply_markup.rows):
+                    for c, btn in enumerate(row.buttons):
+                        if "json" in btn.text.lower():
+                            row_idx, col_idx = r, c
+                            break
             
-            if not target_button:
-                return {"status": "failed", "msg": "JSON Button missing in bot response"}
+            if row_idx is None:
+                return {"status": "failed", "msg": "Download JSON Button not found"}
 
-            # 4. GREEDY DOWNLOAD LISTENER & BUTTON CLICK
+            # 4. DOWNLOAD LISTENER (Active BEFORE Click)
             file_future = asyncio.get_event_loop().create_future()
 
             async def handler_file(event):
-                # Jaise hi koi JSON file aaye usko grab karlo
-                if event.document and event.document.mime_type == "application/json":
-                    if not file_future.done():
-                        file_future.set_result(event)
+                if event.chat_id == GROUP_ID and event.document:
+                    if event.document.mime_type == "application/json":
+                        if not file_future.done():
+                            file_future.set_result(event)
 
             client.add_event_handler(handler_file, events.NewMessage)
 
             try:
-                await bot_msg.click(text=target_button.text)
-                logger.info("🔘 Clicked Download JSON")
+                # Papaji, click karne se pehle 1.5 second ka gap (Safety)
+                await asyncio.sleep(1.5)
                 
+                # Precise Index-based Click
+                await bot_msg.click(row_idx, col_idx)
+                logger.info(f"🔘 Clicked Button at Row {row_idx}, Col {col_idx}")
+                
+                # Wait for file
                 file_event = await asyncio.wait_for(file_future, timeout=REQUEST_TIMEOUT)
+                logger.info("📎 JSON File Received!")
+                
                 content = await client.download_media(file_event.message, bytes)
                 raw_data = json.loads(content.decode())
                 
-                cleaned_data = clean_json(raw_data)
-                return {"status": "success", "data": cleaned_data}
+                return {"status": "success", "data": raw_data}
                 
             except asyncio.TimeoutError:
-                return {"status": "failed", "msg": "File download timeout"}
+                return {"status": "failed", "msg": "Bot did not send file after click"}
             finally:
                 client.remove_event_handler(handler_file)
 
         except Exception as e:
-            logger.error(f"❌ Error: {str(e)}")
+            logger.error(f"❌ Critical Error: {str(e)}")
             return {"status": "failed", "msg": str(e)}
 
 # ================= WEB APP =================
@@ -120,7 +111,7 @@ app = Quart(__name__)
 @app.before_serving
 async def startup():
     await client.start()
-    logger.info("🚀 ENGINE LOADED - GREEDY MODE AKTIVE")
+    logger.info("🚀 PAPAJI BRIDGE V6.0 ONLINE")
 
 @app.route("/api")
 async def api_router():
@@ -137,7 +128,7 @@ async def api_router():
     result = await get_json_from_bot(num, cmd)
     
     if not result:
-        return jsonify({"status": "failed", "msg": "Internal System Error"}), 500
+        return jsonify({"status": "failed", "msg": "Internal Error"}), 500
     
     return jsonify(result)
 
