@@ -53,13 +53,21 @@ async def get_raw_text_from_group(query: str, command: str, target_bot_username:
             # ✅ SMART MATCH
             text_lower = text.lower()
             query_lower = str(query).lower()
-
+            
+            # ✅ match query
             match_query = query_lower in text_lower
+            
+            # ✅ useful keywords
             match_keywords = any(x in text_lower for x in ["number", "name", "telegram", "id"])
-
+            
+            # ❌ ignore junk messages
+            ignore_words = ["searching", "processing", "wait", "fetching"]
+            
+            # ✅ FINAL FILTER
             if text and (match_query or match_keywords):
-                if not bot_msg_future.done():
-                    bot_msg_future.set_result(text)
+                if not any(x in text_lower for x in ignore_words):
+                    if not bot_msg_future.done():
+                        bot_msg_future.set_result(text)
 
         # ✅ ADD HANDLER FIRST
         client.add_event_handler(handler_msg, events.NewMessage(chats=GROUP_ID))
