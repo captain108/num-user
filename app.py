@@ -38,30 +38,34 @@ async def get_raw_text_from_group(query: str, command: str, target_bot_username:
 
         bot_msg_future = asyncio.get_event_loop().create_future()
 
-        # ✅ HANDLER FIRST
+        # ✅ HANDLER
         async def handler_msg(event):
             sender = await event.get_sender()
             text = event.message.raw_text or ""
 
             logger.info(f"📩 @{getattr(sender,'username','unknown')}: {text}")
 
-            # ✅ ALLOWED BOT FILTER (SAFE)
-            ALLOWED = [NX_BOT.lower(), UNKNOWN_BOT.lower()]
-
+            # ✅ ONLY TARGET BOT
             if sender and sender.username:
-                if sender.username.lower() not in ALLOWED:
+                if sender.username.lower() != target_bot_username.lower():
                     return
 
-            # ✅ SIMPLE CAPTURE
-            if text:
+            # ✅ SMART MATCH
+            text_lower = text.lower()
+            query_lower = str(query).lower()
+
+            match_query = query_lower in text_lower
+            match_keywords = any(x in text_lower for x in ["number", "name", "telegram", "id"])
+
+            if text and (match_query or match_keywords):
                 if not bot_msg_future.done():
                     bot_msg_future.set_result(text)
 
         # ✅ ADD HANDLER FIRST
         client.add_event_handler(handler_msg, events.NewMessage(chats=GROUP_ID))
 
-        # ✅ THEN SEND MESSAGE
-        sent_msg = await client.send_message(GROUP_ID, f"{command} {query}")
+        # ✅ SEND MESSAGE
+        await client.send_message(GROUP_ID, f"{command} {query}")
 
         try:
             raw_text = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
@@ -76,7 +80,7 @@ async def get_raw_text_from_group(query: str, command: str, target_bot_username:
 
         finally:
             client.remove_event_handler(handler_msg)
-
+            
 # ================= WEB APP ROUTER =================
 app = Quart(__name__)
 
