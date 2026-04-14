@@ -19,8 +19,8 @@ GROUP_ID = int(os.getenv("GROUP_ID"))
 API_KEY = os.getenv("API_KEY")
 
 # Remove '@' if Papaji accidentally added it in .env
-NX_BOT = os.getenv("NX_BOT_USERNAME").replace("@", "")
-UNKNOWN_BOT = os.getenv("UNKNOWN_BOT_USERNAME").replace("@", "")
+NX_BOT = (os.getenv("NX_BOT_USERNAME") or "").replace("@", "")
+UNKNOWN_BOT = (os.getenv("UNKNOWN_BOT_USERNAME") or "").replace("@", "")
 
 # Render free tier safe limit
 REQUEST_TIMEOUT = 28 
