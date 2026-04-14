@@ -31,59 +31,48 @@ engine_lock = asyncio.Lock()  # Prevents overlapping requests (Anti-Spam)
 
 # ================= CORE ENGINE (THE SMART SCRAPER) =================
 async def get_raw_text_from_group(query: str, command: str, target_bot_username: str):
-    async with engine_lock: 
-        logger.info(f"🚀 MISSION: {command} {query} | Target Lock: {target_bot_username}")
-        
+    async with engine_lock:
+
         if not client.is_connected():
             await client.connect()
 
+        sent_msg = await client.send_message(GROUP_ID, f".\n{command} {query}")
+        bot_msg_future = asyncio.get_event_loop().create_future()
+
+        async def handler_msg(event):
+            if event.chat_id == GROUP_ID:
+                sender = await event.get_sender()
+
+                logger.info(f"📩 @{getattr(sender,'username','unknown')}: {event.message.raw_text}")
+
+                if sender and sender.username:
+                    if sender.username.lower() != target_bot_username.lower():
+                        return
+
+                text = event.message.raw_text.lower() if event.message.raw_text else ""
+
+                is_reply = event.reply_to_msg_id == sent_msg.id if event.reply_to_msg_id else False
+                has_query = query.lower() in text if text else False
+
+                if is_reply or has_query:
+                    if not bot_msg_future.done():
+                        bot_msg_future.set_result(event.message.raw_text)
+
+        client.add_event_handler(handler_msg, events.NewMessage)
+
         try:
-            # 1. SEND COMMAND (Papaji's Format: Dot + Newline + Command)
-            sent_msg = await client.send_message(GROUP_ID, f".\n{command} {query}")
-            
-            bot_msg_future = asyncio.get_event_loop().create_future()
+            raw_text = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
 
-            # 2. STRICT SENDER LISTENER (Ignores Wrong Bots)
-            async def handler_msg(event):
-                if event.chat_id == GROUP_ID:
-                    sender = await event.get_sender()
-                    
-                    # Verify if the sender is exactly the bot we want
-                    if sender and sender.username and sender.username.lower() == target_bot_username.lower():
-                        text = event.message.raw_text.lower()
-                        
-                        # Match Logic: Is it a reply to our command? Or does it contain the query?
-                        is_reply = event.reply_to_msg_id == sent_msg.id
-                        has_query = query.lower() in text
-                        
-                        if is_reply or has_query:
-                            if not bot_msg_future.done():
-                                # We capture the EXACT text with formatting
-                                bot_msg_future.set_result(event.message.raw_text)
+            return {
+                "status": "success",
+                "data": {"raw_response": raw_text}
+            }
 
-            client.add_event_handler(handler_msg, events.NewMessage)
+        except asyncio.TimeoutError:
+            return {"status": "failed", "msg": "Timeout"}
 
-            try:
-                # Wait for the specific bot to drop the data
-                raw_text = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
-                logger.info(f"✅ Target Eliminated! Data Captured from {target_bot_username}")
-                
-                return {
-                    "status": "success", 
-                    "data": {
-                        "raw_response": raw_text
-                    }
-                }
-                
-            except asyncio.TimeoutError:
-                logger.warning(f"⏳ Timeout: {target_bot_username} is sleeping or dead.")
-                return {"status": "failed", "msg": f"Timeout: {target_bot_username} did not respond"}
-            finally:
-                client.remove_event_handler(handler_msg) # Clean up memory
-
-        except Exception as e:
-            logger.error(f"❌ System Error: {str(e)}")
-            return {"status": "failed", "msg": str(e)}
+        finally:
+            client.remove_event_handler(handler_msg)
 
 # ================= WEB APP ROUTER =================
 app = Quart(__name__)
