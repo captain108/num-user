@@ -36,29 +36,32 @@ async def get_raw_text_from_group(query: str, command: str, target_bot_username:
         if not client.is_connected():
             await client.connect()
 
-        sent_msg = await client.send_message(GROUP_ID, f"{command} {query}")
         bot_msg_future = asyncio.get_event_loop().create_future()
 
+        # ✅ HANDLER FIRST
         async def handler_msg(event):
-            if event.chat_id == GROUP_ID:
-                sender = await event.get_sender()
+            sender = await event.get_sender()
+            text = event.message.raw_text or ""
 
-                logger.info(f"📩 @{getattr(sender,'username','unknown')}: {event.message.raw_text}")
+            logger.info(f"📩 @{getattr(sender,'username','unknown')}: {text}")
 
-                if sender and sender.username:
-                    if sender.username.lower() != target_bot_username.lower():
-                        return
+            # ✅ ALLOWED BOT FILTER (SAFE)
+            ALLOWED = [NX_BOT.lower(), UNKNOWN_BOT.lower()]
 
-                text = event.message.raw_text.lower() if event.message.raw_text else ""
+            if sender and sender.username:
+                if sender.username.lower() not in ALLOWED:
+                    return
 
-                is_reply = event.reply_to_msg_id == sent_msg.id if event.reply_to_msg_id else False
-                has_query = query.lower() in text if text else False
+            # ✅ SIMPLE CAPTURE
+            if text:
+                if not bot_msg_future.done():
+                    bot_msg_future.set_result(text)
 
-                if is_reply or has_query:
-                    if not bot_msg_future.done():
-                        bot_msg_future.set_result(event.message.raw_text)
+        # ✅ ADD HANDLER FIRST
+        client.add_event_handler(handler_msg, events.NewMessage(chats=GROUP_ID))
 
-        client.add_event_handler(handler_msg, events.NewMessage)
+        # ✅ THEN SEND MESSAGE
+        sent_msg = await client.send_message(GROUP_ID, f"{command} {query}")
 
         try:
             raw_text = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
