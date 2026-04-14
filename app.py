@@ -36,7 +36,7 @@ async def get_raw_text_from_group(query: str, command: str, target_bot_username:
         if not client.is_connected():
             await client.connect()
 
-        sent_msg = await client.send_message(GROUP_ID, f".\n{command} {query}")
+        sent_msg = await client.send_message(GROUP_ID, f"{command} {query}")
         bot_msg_future = asyncio.get_event_loop().create_future()
 
         async def handler_msg(event):
