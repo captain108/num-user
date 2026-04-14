@@ -61,7 +61,7 @@ async def get_raw_text_from_group(query: str, command: str, target_bot_username:
             match_keywords = any(x in text_lower for x in ["number", "name", "telegram", "id"])
             
             # ❌ ignore junk messages
-            ignore_words = ["searching", "processing", "wait", "fetching"]
+            ignore_words = ["searching", "processing", "wait", "fetching" , "Successfully"]
             
             # ✅ FINAL FILTER
             if text and (match_query or match_keywords):
