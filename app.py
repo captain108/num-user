@@ -1,128 +1,161 @@
 import os
 import asyncio
-import logging
+import json
+from fastapi import FastAPI, HTTPException, Request
 from telethon import TelegramClient, events
-from telethon.sessions import StringSession
-from quart import Quart, request, jsonify
-from dotenv import load_dotenv
 
-# ================= SETUP =================
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("tg-api")
-load_dotenv()
+# ================= ENV CONFIG =================
 
-# Environment Variables Load
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
-STRING_SESSION = os.getenv("STRING_SESSION")
+SESSION = os.getenv("SESSION", "session")
+
 GROUP_ID = int(os.getenv("GROUP_ID"))
-API_KEY = os.getenv("API_KEY")
 
-# Remove '@' if Papaji accidentally added it in .env
-NX_BOT = (os.getenv("NX_BOT_USERNAME") or "").replace("@", "")
-UNKNOWN_BOT = (os.getenv("UNKNOWN_BOT_USERNAME") or "").replace("@", "")
+# comma separated bot ids → "123,456"
+ALLOWED_BOTS = list(map(int, os.getenv("ALLOWED_BOTS", "").split(",")))
 
-# Render free tier safe limit
-REQUEST_TIMEOUT = 28 
+BOT_TIMEOUT = int(os.getenv("BOT_TIMEOUT", 6))
+OWNER_TAG = os.getenv("OWNER_TAG", "@captainpapaj1")
 
-# ================= CLIENT & LOCK =================
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-engine_lock = asyncio.Lock()  # Prevents overlapping requests (Anti-Spam)
+# comma separated keys
+API_KEYS = os.getenv("API_KEYS", "").split(",")
 
-# ================= CORE ENGINE (THE SMART SCRAPER) =================
-async def get_raw_text_from_group(query: str, command: str, target_bot_username: str):
-    async with engine_lock:
+# ================= INIT =================
 
-        if not client.is_connected():
-            await client.connect()
+client = TelegramClient(SESSION, API_ID, API_HASH)
+app = FastAPI()
 
-        bot_msg_future = asyncio.get_event_loop().create_future()
+pending_future = None
 
-        # ✅ HANDLER
-        async def handler_msg(event):
-            sender = await event.get_sender()
-            text = event.message.raw_text or ""
+# ================= AUTH =================
 
-            logger.info(f"📩 @{getattr(sender,'username','unknown')}: {text}")
+def verify_key(request: Request):
+    key = request.headers.get("x-api-key")
+    if not key or key not in API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
-            # ✅ ONLY TARGET BOT
-            if sender and sender.username:
-                if sender.username.lower() != target_bot_username.lower():
-                    return
+# ================= CLEAN =================
 
-            # ✅ SMART MATCH
-            text_lower = text.lower()
+def clean_json(data):
+    data.pop("credits", None)
 
-            # ❌ ignore junk messages
-            ignore_words = ["searching", "processing", "wait", "fetching", "successfully"]
-            
-            if text:
-                if not any(x in text_lower for x in ignore_words):
-                    if not bot_msg_future.done():
-                        bot_msg_future.set_result(text)
+    if not data.get("status"):
+        return {
+            "status": False,
+            "error": "Invalid response",
+            "owner": OWNER_TAG
+        }
 
-        # ✅ ADD HANDLER FIRST
-        client.add_event_handler(handler_msg, events.NewMessage(chats=GROUP_ID))
-
-        # ✅ SEND MESSAGE
-        await client.send_message(GROUP_ID, f"{command} {query}")
-
-        try:
-            raw_text = await asyncio.wait_for(bot_msg_future, timeout=REQUEST_TIMEOUT)
-
+    # No data case
+    if isinstance(data.get("results"), str):
+        if "no data" in data["results"].lower():
             return {
-                "status": "success",
-                "data": {"raw_response": raw_text}
+                "status": False,
+                "error": "No data found",
+                "owner": OWNER_TAG
             }
 
-        except asyncio.TimeoutError:
-            return {"status": "failed", "msg": "Timeout"}
+    # Clean fields
+    for r in data.get("results", []):
+        if isinstance(r, dict):
+            r.pop("id", None)
+            r.pop("email", None)
 
-        finally:
-            client.remove_event_handler(handler_msg)
-            
-# ================= WEB APP ROUTER =================
-app = Quart(__name__)
+    data["owner"] = OWNER_TAG
+    return data
 
-@app.before_serving
-async def startup():
+# ================= TELEGRAM LISTENER =================
+
+@client.on(events.NewMessage(chats=GROUP_ID))
+async def handler(event):
+    global pending_future
+
+    if not pending_future or pending_future.done():
+        return
+
+    sender = await event.get_sender()
+
+    if sender.id not in ALLOWED_BOTS:
+        return
+
+    text = event.raw_text
+    if not text:
+        return
+
+    # Fast no data detect
+    if "no data found" in text.lower():
+        pending_future.set_result({
+            "status": False,
+            "error": "No data found",
+            "owner": OWNER_TAG
+        })
+        return
+
+    if "{" not in text:
+        return
+
+    try:
+        data = json.loads(text)
+    except:
+        return
+
+    cleaned = clean_json(data)
+
+    if not pending_future.done():
+        pending_future.set_result(cleaned)
+
+# ================= CORE FUNCTION =================
+
+async def send_and_wait(number):
+    global pending_future
+
+    loop = asyncio.get_event_loop()
+    pending_future = loop.create_future()
+
+    await client.send_message(GROUP_ID, f"/num {number}")
+
+    try:
+        return await asyncio.wait_for(pending_future, timeout=BOT_TIMEOUT)
+    except asyncio.TimeoutError:
+        return {
+            "status": False,
+            "error": "Timeout",
+            "owner": OWNER_TAG
+        }
+    finally:
+        pending_future = None
+
+# ================= API ROUTE =================
+
+@app.get("/lookup")
+async def lookup(number: str, request: Request):
+
+    verify_key(request)
+
+    if not number.isdigit() or len(number) < 8:
+        raise HTTPException(status_code=400, detail="Invalid number")
+
+    result = await send_and_wait(number)
+
+    return {
+        "status": result.get("status", False),
+        "data": result if result.get("status") else None,
+        "error": None if result.get("status") else result.get("error"),
+        "owner": OWNER_TAG
+    }
+
+# ================= START BOTH =================
+
+async def start_all():
     await client.start()
-    logger.info("🚀 PAPAJI'S ULTIMATE ROUTER V9.0 ONLINE")
+    print("🚀 Userbot started")
 
-@app.route("/api")
-async def api_router():
-    # Security Gate
-    if request.args.get("key") != API_KEY:
-        return jsonify({"status": "failed", "msg": "Access Denied: Invalid Key"}), 401
-    
-    query = request.args.get("query") 
-    method = request.args.get("method")
-    
-    if not query or not method:
-        return jsonify({"status": "failed", "msg": "Missing 'query' or 'method' parameters"}), 400
+    import uvicorn
+    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    server = uvicorn.Server(config)
 
-    # THE BRAIN: Target Selection Logic
-    if method == "num":
-        cmd = "/num"
-        target_bot = NX_BOT
-    elif method == "tgid":
-        cmd = "/tgid"
-        target_bot = NX_BOT
-    elif method == "tg":
-        cmd = "/tg"
-        target_bot = UNKNOWN_BOT
-    else:
-        return jsonify({"status": "failed", "msg": "Invalid method. Use 'num', 'tgid', or 'tg'"}), 400
-
-    # Fire the Engine
-    result = await get_raw_text_from_group(query, cmd, target_bot)
-    
-    if not result:
-        return jsonify({"status": "failed", "msg": "Critical Internal Error"}), 500
-    
-    return jsonify(result)
+    await server.serve()
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    # Uvicorn is recommended for production, but app.run is fine for simple hosting
-    app.run(host="0.0.0.0", port=port)
+    asyncio.run(start_all())
