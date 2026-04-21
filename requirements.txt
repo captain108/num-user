@@ -1,4 +1,4 @@
 telethon
-quart
+fastapi
+uvicorn
 python-dotenv
-hypercorn
