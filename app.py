@@ -81,13 +81,19 @@ async def worker():
     while True:
         number, request_id = await queue.get()
 
+        print(f"📤 Sending: {number}")
+
         try:
             await client.send_message(GROUP_ID, f"/num {number}")
-        except:
+            print("✅ Sent successfully")
+
+        except Exception as e:
+            print("❌ SEND ERROR:", e)
+
             if request_id in request_map:
                 request_map[request_id].set_result({
                     "status": False,
-                    "error": "Send failed",
+                    "error": str(e),
                     "owner": OWNER_TAG
                 })
 
@@ -112,20 +118,35 @@ async def startup():
         )
 
         await client.start()
-        print("🚀 Userbot connected")
 
+        # ✅ VERIFY LOGIN
+        me = await client.get_me()
+        print(f"🚀 Logged in as: {me.id}")
+
+        # ✅ VERIFY GROUP ACCESS
+        try:
+            group = await client.get_entity(GROUP_ID)
+            print(f"📡 Connected to group: {group.title}")
+        except Exception as e:
+            print("❌ GROUP ERROR:", e)
+            return
+
+        # ✅ START WORKER AFTER EVERYTHING OK
         asyncio.create_task(worker())
+        print("⚙️ Worker started")
 
+        # ================= HANDLER =================
         @client.on(events.NewMessage(chats=GROUP_ID))
         async def handler(event):
 
             sender = await event.get_sender()
 
-            # 🔥 ONLY TARGET BOT
             if sender.id != TARGET_BOT_ID:
                 return
 
             text = event.raw_text or ""
+
+            print("📥 Response received")
 
             for number, req_id in list(number_map.items()):
 
@@ -137,7 +158,6 @@ async def startup():
                 if future.done():
                     continue
 
-                # fast no data
                 if "no data found" in text.lower():
                     result = {
                         "status": False,
@@ -156,18 +176,16 @@ async def startup():
 
                     result = clean_json(data)
 
-                # cache
                 cache[number] = (time.time(), result)
 
                 future.set_result(result)
 
-                # cleanup
                 request_map.pop(req_id, None)
                 number_map.pop(number, None)
 
     except Exception as e:
         print("❌ Startup error:", e)
-
+        
 # ================= CORE =================
 
 async def process_request(number):
