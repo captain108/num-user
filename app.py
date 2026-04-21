@@ -6,48 +6,44 @@ import uuid
 from fastapi import FastAPI, HTTPException, Request
 from telethon import TelegramClient, events
 
-# ================= ENV =================
+app = FastAPI()
 
-def get_env(name, default=None, required=True):
-    val = os.getenv(name, default)
-    if required and val is None:
-        raise RuntimeError(f"Missing ENV: {name}")
-    return val
+# ================= SAFE ENV =================
 
-API_ID = int(get_env("API_ID"))
-API_HASH = get_env("API_HASH")
-SESSION = get_env("SESSION", "session", required=False)
+def get_env_int(name, default=None):
+    try:
+        return int(os.getenv(name, default))
+    except:
+        return default
 
-GROUP_ID = int(get_env("GROUP_ID"))
+def get_env_str(name, default=""):
+    return os.getenv(name, default)
 
-ALLOWED_BOTS = os.getenv("ALLOWED_BOTS", "")
+# Load safely (NO CRASH)
+API_ID = get_env_int("API_ID")
+API_HASH = get_env_str("API_HASH")
+SESSION = get_env_str("SESSION", "session")
+
+GROUP_ID = get_env_int("GROUP_ID")
+
+ALLOWED_BOTS = get_env_str("ALLOWED_BOTS")
 ALLOWED_BOTS = list(map(int, ALLOWED_BOTS.split(","))) if ALLOWED_BOTS else []
 
-BOT_TIMEOUT = int(get_env("BOT_TIMEOUT", 6, required=False))
-OWNER_TAG = get_env("OWNER_TAG", "@captainpapaj1", required=False)
+BOT_TIMEOUT = get_env_int("BOT_TIMEOUT", 6)
+OWNER_TAG = get_env_str("OWNER_TAG", "@captainpapaj1")
 
-API_KEYS = os.getenv("API_KEYS", "").split(",")
+API_KEYS = get_env_str("API_KEYS").split(",") if get_env_str("API_KEYS") else []
+
+CONFIG_OK = all([API_ID, API_HASH, GROUP_ID])
 
 # ================= INIT =================
 
-app = FastAPI()
-
-client = TelegramClient(
-    SESSION,
-    API_ID,
-    API_HASH,
-    connection_retries=None
-)
-
-# ================= SYSTEM STORAGE =================
-
-request_map = {}      # request_id -> future
-number_map = {}       # number -> request_id
-cache = {}            # number -> (timestamp, result)
-
+client = None
+request_map = {}
+number_map = {}
+cache = {}
 queue = asyncio.Queue()
-
-CACHE_TTL = 300  # 5 minutes
+CACHE_TTL = 300
 
 # ================= AUTH =================
 
@@ -84,7 +80,7 @@ async def worker():
 
         try:
             await client.send_message(GROUP_ID, f"/num {number}")
-        except Exception as e:
+        except:
             if request_id in request_map:
                 request_map[request_id].set_result({
                     "status": False,
@@ -94,38 +90,40 @@ async def worker():
 
         queue.task_done()
 
-# ================= TELEGRAM LISTENER =================
+# ================= STARTUP =================
 
 @app.on_event("startup")
 async def startup():
+    global client
 
+    if not CONFIG_OK:
+        print("❌ Missing ENV variables — API running in debug mode")
+        return
+
+    client = TelegramClient(SESSION, API_ID, API_HASH)
     await client.start()
+
     print("🚀 Userbot started")
 
-    # Start worker
     asyncio.create_task(worker())
 
     @client.on(events.NewMessage(chats=GROUP_ID))
     async def handler(event):
 
         sender = await event.get_sender()
-
         if sender.id not in ALLOWED_BOTS:
             return
 
         text = event.raw_text or ""
 
-        # detect number (simple match)
         for number, req_id in list(number_map.items()):
             if req_id not in request_map:
                 continue
 
             future = request_map[req_id]
-
             if future.done():
                 continue
 
-            # FAST no data
             if "no data found" in text.lower():
                 result = {
                     "status": False,
@@ -143,12 +141,10 @@ async def startup():
 
                 result = clean_json(data)
 
-            # Save cache
             cache[number] = (time.time(), result)
 
             future.set_result(result)
 
-            # cleanup
             request_map.pop(req_id, None)
             number_map.pop(number, None)
 
@@ -156,35 +152,37 @@ async def startup():
 
 async def process_request(number):
 
-    # ✅ CACHE CHECK
+    if not CONFIG_OK:
+        return {"status": False, "error": "Server not configured"}
+
     if number in cache:
         ts, data = cache[number]
         if time.time() - ts < CACHE_TTL:
             return data
 
     request_id = str(uuid.uuid4())
-
     loop = asyncio.get_event_loop()
     future = loop.create_future()
 
     request_map[request_id] = future
     number_map[number] = request_id
 
-    # push to queue
     await queue.put((number, request_id))
 
     try:
         return await asyncio.wait_for(future, timeout=BOT_TIMEOUT)
     except asyncio.TimeoutError:
-        request_map.pop(request_id, None)
-        number_map.pop(number, None)
         return {"status": False, "error": "Timeout", "owner": OWNER_TAG}
 
 # ================= ROUTES =================
 
 @app.get("/")
 async def home():
-    return {"status": True, "message": "API running", "owner": OWNER_TAG}
+    return {
+        "status": CONFIG_OK,
+        "message": "API Running" if CONFIG_OK else "Missing ENV variables",
+        "owner": OWNER_TAG
+    }
 
 @app.get("/lookup")
 async def lookup(number: str, request: Request):
