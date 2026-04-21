@@ -1,38 +1,59 @@
 import os
 import asyncio
 import json
+import time
+import uuid
 from fastapi import FastAPI, HTTPException, Request
 from telethon import TelegramClient, events
 
-# ================= ENV CONFIG =================
+# ================= ENV =================
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-SESSION = os.getenv("SESSION", "session")
+def get_env(name, default=None, required=True):
+    val = os.getenv(name, default)
+    if required and val is None:
+        raise RuntimeError(f"Missing ENV: {name}")
+    return val
 
-GROUP_ID = int(os.getenv("GROUP_ID"))
+API_ID = int(get_env("API_ID"))
+API_HASH = get_env("API_HASH")
+SESSION = get_env("SESSION", "session", required=False)
 
-# comma separated bot ids → "123,456"
-ALLOWED_BOTS = list(map(int, os.getenv("ALLOWED_BOTS", "").split(",")))
+GROUP_ID = int(get_env("GROUP_ID"))
 
-BOT_TIMEOUT = int(os.getenv("BOT_TIMEOUT", 6))
-OWNER_TAG = os.getenv("OWNER_TAG", "@captainpapaj1")
+ALLOWED_BOTS = os.getenv("ALLOWED_BOTS", "")
+ALLOWED_BOTS = list(map(int, ALLOWED_BOTS.split(","))) if ALLOWED_BOTS else []
 
-# comma separated keys
+BOT_TIMEOUT = int(get_env("BOT_TIMEOUT", 6, required=False))
+OWNER_TAG = get_env("OWNER_TAG", "@captainpapaj1", required=False)
+
 API_KEYS = os.getenv("API_KEYS", "").split(",")
 
 # ================= INIT =================
 
-client = TelegramClient(SESSION, API_ID, API_HASH)
 app = FastAPI()
 
-pending_future = None
+client = TelegramClient(
+    SESSION,
+    API_ID,
+    API_HASH,
+    connection_retries=None
+)
+
+# ================= SYSTEM STORAGE =================
+
+request_map = {}      # request_id -> future
+number_map = {}       # number -> request_id
+cache = {}            # number -> (timestamp, result)
+
+queue = asyncio.Queue()
+
+CACHE_TTL = 300  # 5 minutes
 
 # ================= AUTH =================
 
 def verify_key(request: Request):
     key = request.headers.get("x-api-key")
-    if not key or key not in API_KEYS:
+    if key not in API_KEYS:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
 # ================= CLEAN =================
@@ -41,22 +62,12 @@ def clean_json(data):
     data.pop("credits", None)
 
     if not data.get("status"):
-        return {
-            "status": False,
-            "error": "Invalid response",
-            "owner": OWNER_TAG
-        }
+        return {"status": False, "error": "Invalid response", "owner": OWNER_TAG}
 
-    # No data case
     if isinstance(data.get("results"), str):
         if "no data" in data["results"].lower():
-            return {
-                "status": False,
-                "error": "No data found",
-                "owner": OWNER_TAG
-            }
+            return {"status": False, "error": "No data found", "owner": OWNER_TAG}
 
-    # Clean fields
     for r in data.get("results", []):
         if isinstance(r, dict):
             r.pop("id", None)
@@ -65,78 +76,125 @@ def clean_json(data):
     data["owner"] = OWNER_TAG
     return data
 
+# ================= WORKER =================
+
+async def worker():
+    while True:
+        number, request_id = await queue.get()
+
+        try:
+            await client.send_message(GROUP_ID, f"/num {number}")
+        except Exception as e:
+            if request_id in request_map:
+                request_map[request_id].set_result({
+                    "status": False,
+                    "error": "Send failed",
+                    "owner": OWNER_TAG
+                })
+
+        queue.task_done()
+
 # ================= TELEGRAM LISTENER =================
 
-@client.on(events.NewMessage(chats=GROUP_ID))
-async def handler(event):
-    global pending_future
+@app.on_event("startup")
+async def startup():
 
-    if not pending_future or pending_future.done():
-        return
+    await client.start()
+    print("🚀 Userbot started")
 
-    sender = await event.get_sender()
+    # Start worker
+    asyncio.create_task(worker())
 
-    if sender.id not in ALLOWED_BOTS:
-        return
+    @client.on(events.NewMessage(chats=GROUP_ID))
+    async def handler(event):
 
-    text = event.raw_text
-    if not text:
-        return
+        sender = await event.get_sender()
 
-    # Fast no data detect
-    if "no data found" in text.lower():
-        pending_future.set_result({
-            "status": False,
-            "error": "No data found",
-            "owner": OWNER_TAG
-        })
-        return
+        if sender.id not in ALLOWED_BOTS:
+            return
 
-    if "{" not in text:
-        return
+        text = event.raw_text or ""
 
-    try:
-        data = json.loads(text)
-    except:
-        return
+        # detect number (simple match)
+        for number, req_id in list(number_map.items()):
+            if req_id not in request_map:
+                continue
 
-    cleaned = clean_json(data)
+            future = request_map[req_id]
 
-    if not pending_future.done():
-        pending_future.set_result(cleaned)
+            if future.done():
+                continue
 
-# ================= CORE FUNCTION =================
+            # FAST no data
+            if "no data found" in text.lower():
+                result = {
+                    "status": False,
+                    "error": "No data found",
+                    "owner": OWNER_TAG
+                }
+            else:
+                if "{" not in text:
+                    continue
 
-async def send_and_wait(number):
-    global pending_future
+                try:
+                    data = json.loads(text)
+                except:
+                    continue
+
+                result = clean_json(data)
+
+            # Save cache
+            cache[number] = (time.time(), result)
+
+            future.set_result(result)
+
+            # cleanup
+            request_map.pop(req_id, None)
+            number_map.pop(number, None)
+
+# ================= CORE =================
+
+async def process_request(number):
+
+    # ✅ CACHE CHECK
+    if number in cache:
+        ts, data = cache[number]
+        if time.time() - ts < CACHE_TTL:
+            return data
+
+    request_id = str(uuid.uuid4())
 
     loop = asyncio.get_event_loop()
-    pending_future = loop.create_future()
+    future = loop.create_future()
 
-    await client.send_message(GROUP_ID, f"/num {number}")
+    request_map[request_id] = future
+    number_map[number] = request_id
+
+    # push to queue
+    await queue.put((number, request_id))
 
     try:
-        return await asyncio.wait_for(pending_future, timeout=BOT_TIMEOUT)
+        return await asyncio.wait_for(future, timeout=BOT_TIMEOUT)
     except asyncio.TimeoutError:
-        return {
-            "status": False,
-            "error": "Timeout",
-            "owner": OWNER_TAG
-        }
-    finally:
-        pending_future = None
+        request_map.pop(request_id, None)
+        number_map.pop(number, None)
+        return {"status": False, "error": "Timeout", "owner": OWNER_TAG}
 
-# ================= API ROUTE =================
+# ================= ROUTES =================
+
+@app.get("/")
+async def home():
+    return {"status": True, "message": "API running", "owner": OWNER_TAG}
 
 @app.get("/lookup")
 async def lookup(number: str, request: Request):
 
     verify_key(request)
 
-    if not number.isdigit() or len(number) < 8:
+    if not number.isdigit():
         raise HTTPException(status_code=400, detail="Invalid number")
 
-    result = await send_and_wait(number)
+    result = await process_request(number)
 
     return {
         "status": result.get("status", False),
@@ -144,18 +202,3 @@ async def lookup(number: str, request: Request):
         "error": None if result.get("status") else result.get("error"),
         "owner": OWNER_TAG
     }
-
-# ================= START BOTH =================
-
-async def start_all():
-    await client.start()
-    print("🚀 Userbot started")
-
-    import uvicorn
-    config = uvicorn.Config(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
-    server = uvicorn.Server(config)
-
-    await server.serve()
-
-if __name__ == "__main__":
-    asyncio.run(start_all())
