@@ -45,7 +45,13 @@ CONFIG_OK = all([API_ID, API_HASH, STRING_SESSION, GROUP_ID, TARGET_BOT_ID])
 # ================= AUTH =================
 
 def verify_key(request: Request):
+    # try header first
     key = request.headers.get("x-api-key")
+
+    # fallback to query param
+    if not key:
+        key = request.query_params.get("key")
+
     if key not in API_KEYS:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
